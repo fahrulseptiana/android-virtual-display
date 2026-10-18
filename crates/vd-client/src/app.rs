@@ -5,7 +5,7 @@
 //! list.
 
 use std::net::SocketAddr;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -76,8 +76,12 @@ pub struct VdClientApp {
     browser: Option<Browser>,
     browser_error: Option<String>,
     last_poll: Instant,
-    events_tx: Sender<ConnectionEvent>,
-    events_rx: Receiver<ConnectionEvent>,
+    /// Events from the current connection.
+    ///
+    /// A fresh channel per connection means dropping this drops any stale
+    /// events along with it: a worker that is still winding down cannot put the
+    /// UI back into a "busy" state after the user has left.
+    events_rx: Option<Receiver<ConnectionEvent>>,
     connection: Connection,
     /// The live connection, used to answer pairing requests and to disconnect.
     handle: Option<ConnectionHandle>,
@@ -92,15 +96,13 @@ pub struct VdClientApp {
 impl VdClientApp {
     /// Creates the app and binds the discovery socket.
     pub fn new(trust_path: Option<std::path::PathBuf>) -> Self {
-        let (events_tx, events_rx) = channel();
         let mut app = Self {
             trust_path,
             view: View::Browser,
             browser: None,
             browser_error: None,
             last_poll: Instant::now(),
-            events_tx,
-            events_rx,
+            events_rx: None,
             connection: Connection::Idle,
             handle: None,
             frames: FrameQueue::new(),
@@ -156,9 +158,12 @@ impl VdClientApp {
         }
     }
 
-    /// Drains connection events reported by worker threads.
+    /// Drains connection events reported by the current worker.
     fn poll_connection(&mut self) {
-        while let Ok(event) = self.events_rx.try_recv() {
+        let Some(events) = self.events_rx.as_ref() else {
+            return;
+        };
+        while let Ok(event) = events.try_recv() {
             self.connection = match event {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
                 ConnectionEvent::PairingRequired {
@@ -215,6 +220,9 @@ impl VdClientApp {
             handle.disconnect();
         }
         self.handle = None;
+        // Dropping the receiver also tells the worker to stop: its next send
+        // fails, and it exits rather than retrying behind the user's back.
+        self.events_rx = None;
         self.connection = Connection::Idle;
         self.view = View::Browser;
         self.frames.clear();
@@ -228,10 +236,15 @@ impl VdClientApp {
         };
         self.frames.clear();
         self.texture = None;
+
+        // A channel of its own: whatever the previous worker still wants to say
+        // reaches nobody, because we replace the receiver wholesale.
+        let (events_tx, events_rx) = channel();
+        self.events_rx = Some(events_rx);
         self.handle = Some(connection::connect(
             addr,
             host,
-            self.events_tx.clone(),
+            events_tx,
             self.frames.clone(),
             self.trust_path.clone(),
         ));
