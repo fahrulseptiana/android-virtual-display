@@ -113,17 +113,20 @@ active man-in-the-middle who re-runs the exchange on both sides. See
 
 ### Phase 3 — Desktop capture (Windows)
 
+- [x] Abstraction: `trait FrameSource` returning a frame, so the encoder is
+      capture-agnostic, plus a synthetic `TestPattern` source.
 - [ ] **Primary:** DXGI Desktop Duplication — lowest latency, GPU-resident
       textures, dirty-rect + move-rect metadata.
 - [ ] **Fallback:** Windows.Graphics.Capture — needed for some HDR/protected
       cases and per-window capture.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
-- [ ] Abstraction: `trait FrameSource` returning a frame + dirty regions, so the
-      encoder is capture-agnostic.
 - [ ] Handle display changes (resolution, HDR toggle, monitor add/remove).
 
 ### Phase 4 — Video encode
 
+- [x] Interim codec: JPEG (`vd-core::codec`), enough to prove the pipeline.
+      Measured on the development machine: **4.8 fps at 1280×800**, 8.5 at
+      960×600, 21 at 640×400 — the pure-Rust encoder is the current bottleneck.
 - [ ] **Primary:** hardware H.264 via Media Foundation MFTs (AMD AMF / NVENC /
       QuickSync), zero-copy from the capture texture.
 - [ ] **Fallback:** software x264 at reduced quality.
@@ -150,6 +153,8 @@ negotiation from Phase 2.
 
 ### Phase 6 — Android decode + render
 
+- [x] JPEG decode on the client and display through an egui texture, off the UI
+      thread, with a one-slot mailbox so the display never lags the stream.
 - [ ] `MediaCodec` in async mode, decode to an `AImageReader`/`Surface`.
 - [ ] Render the video surface directly (SurfaceView/texture) under a thin egui
       overlay for connection status.
@@ -230,8 +235,8 @@ Instrumentation ships from Phase 3 onward so regressions are visible.
 |-----------|----------|--------|
 | **M1 — Discoverable** ✅ | Hosts show up on the device | 0–1 |
 | **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
-| **M3 — First frame** | Capture → encode → TCP → decode → screen | 3–6 (minimal) |
-| **M4 — Usable** | 1080p30+, < 100 ms, stable | 5–6 |
+| **M3 — First frame** ✅ | Synthetic capture → JPEG → encrypted TCP → decode → screen | 3–6 (minimal) |
+| **M4 — Usable** | Real DXGI capture, hardware H.264, 1080p30+, < 100 ms | 3–6 |
 | **M5 — Interactive** | Input forwarding | 7 |
 | **M6 — Native feel** | 1080p60, < 50 ms, audio, reconnect | 5–8 |
 

@@ -12,12 +12,11 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: discovery + control channel.** The client finds hosts on the LAN,
-> opens an encrypted control session with one, and confirms a pairing PIN. The
-> virtual-display **video transport is not implemented yet** — the control
-> channel is the foundation it will run on. Discovery, pairing and heartbeats
-> are verified on a real Android device talking to a real Windows host over
-> Wi-Fi.
+> **Status: video works end to end.** The client discovers a host, pairs,
+> opens an encrypted session and displays a live video stream. Capture is still
+> synthetic (a moving test pattern) and the interim JPEG codec runs at ~5 fps at
+> 1280×800, so this is *M3 — first frame*, not yet usable. Real desktop capture
+> (DXGI) and hardware H.264 are next.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -80,7 +79,7 @@ Both sides are **poll driven** (`poll(now)`), which lets the same state machines
 run in a CLI loop on Windows and in an egui repaint loop on Android.
 
 Reserved for later: TCP port **47701** (`HostInfo::control_port`) carries the
-control session and, eventually, the display stream.
+control session and the video stream.
 
 ---
 
@@ -111,6 +110,24 @@ auto-approves**. The host's `Welcome` carries an HMAC key-confirmation tag.
 
 The messages live in [`vd_core::session`](crates/vd-core/src/session) and the
 state machines are transport-agnostic (and unit tested without sockets).
+
+### Video frames
+
+Video rides the same encrypted connection. Each payload starts with a one-byte
+kind *inside* the sealed plaintext, so a frame is either a control message or a
+binary video frame (`vd_core::video`): a 26-byte header (version, format,
+dimensions, sequence, timestamp) followed by the encoded image.
+
+The host captures through a `FrameSource`, encodes and fans the result out to
+every client through a `Broadcaster`. Each client gets a single-slot channel, so
+a slow client misses frames instead of queueing them. Capture pauses entirely
+when nobody is watching.
+
+The client decodes off the UI thread into a one-slot mailbox and uploads the
+newest frame as a texture, so the display never lags behind the stream.
+
+> The interim codec is JPEG. It is slow (≈5 fps at 1280×800) and exists only to
+> prove the pipeline; hardware H.264 is the next step.
 
 ### Security note
 
@@ -204,10 +221,11 @@ The project deliberately leans on a few principles:
 - [x] Windows host + Android client from one Rust codebase
 - [x] Control channel on TCP 47701: handshake, capability exchange, PIN pairing,
       encryption, heartbeats and automatic reconnect
+- [x] Video pipeline end to end: frame protocol, capture abstraction, encoded
+      frames over the encrypted channel, client render (synthetic source + JPEG)
+- [ ] Real desktop capture (DXGI Desktop Duplication)
+- [ ] Hardware H.264 encode (Media Foundation) and decode (MediaCodec)
 - [ ] Trust-on-first-use host identity (authenticated pairing)
-- [ ] Desktop capture on Windows (DXGI Desktop Duplication)
-- [ ] Hardware video encode (Media Foundation / NVENC)
-- [ ] Android decode (MediaCodec) and render
 - [ ] Touch / keyboard input forwarding
 
 ## Testing
