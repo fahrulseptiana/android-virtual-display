@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The APK is *native only*: every piece of application logic lives in the Rust
+// `vd-client` cdylib, which is compiled by `cargo ndk` into
+// `src/main/jniLibs/<abi>/libvd_client.so`. There is no Java/Kotlin code, so
+// `android:hasCode="false"` (see AndroidManifest.xml) applies.
+android {
+    namespace = "id.fahrul.vd"
+    compileSdk = 36
+    // Only used by AGP to strip the prebuilt .so files.
+    ndkVersion = "30.0.16248370"
+
+    defaultConfig {
+        applicationId = "id.fahrul.vd"
+        minSdk = 31
+        targetSdk = 36
+        versionCode = 1
+        versionName = "0.1.0"
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled = false
+            debuggable = true
+        }
+        release {
+            minifyEnabled = false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    // Keep only the ABIs that cargo-ndk produced; remove empty ones.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+}
+
+dependencies {
+}
+
+// The app is pure Rust: there is no Java/Kotlin code, so the Kotlin standard
+// library that AGP adds by default is dead weight (it would produce a ~10 MB
+// unused classes.dex).
+configurations.configureEach {
+    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib'
+}
