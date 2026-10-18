@@ -109,10 +109,13 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
 
-        // Capture and (later) encoding share one device so frames never cross
-        // GPU boundaries.
+        // Capture and encoding share one device so frames never cross GPU boundaries.
         match gpu::create_device() {
             Ok(gpu) => {
+                if std::env::var_os("VD_ENCODER_CHECK").is_some() {
+                    encoder_check(&gpu, width, height);
+                    std::process::exit(0);
+                }
                 match dxgi::DxgiCapture::new(gpu.device.clone(), gpu.context.clone(), output) {
                     Ok(capture) => return Box::new(capture),
                     Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
@@ -122,6 +125,57 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
         }
     }
     Box::new(TestPattern::new(width, height))
+}
+
+/// Diagnostic: encode a few synthetic frames and report, so the hardware encoder
+/// can be verified without a client.
+#[cfg(windows)]
+fn encoder_check(gpu: &gpu::GpuDevice, width: u32, height: u32) {
+    // NV12 subsamples chroma 2x2, so the dimensions must be even.
+    let (width, height) = (width & !1, height & !1);
+
+    let prefer_hardware = std::env::var("VD_ENCODER").as_deref() != Ok("software");
+    let mut encoder = match encoder::h264::H264Encoder::new(
+        &gpu.device,
+        width,
+        height,
+        30,
+        8_000_000,
+        prefer_hardware,
+    ) {
+        Ok(encoder) => encoder,
+        Err(err) => {
+            warn!("encoder check failed: {err}");
+            return;
+        }
+    };
+    info!("encoder check: {}", encoder.describe());
+
+    let frames = 30u64;
+    let mut units = 0usize;
+    let mut bytes = 0usize;
+    for index in 0..frames {
+        // A slightly changing flat field, so the encoder has something to do.
+        let luma = 16 + (index % 200) as u8;
+        let frame = vec![luma; (width * height * 3 / 2) as usize];
+        match encoder.encode(&frame, index * 33_333) {
+            Ok(outputs) => {
+                for unit in outputs {
+                    units += 1;
+                    bytes += unit.len();
+                }
+            }
+            Err(err) => {
+                warn!("encoder check failed while encoding: {err}");
+                return;
+            }
+        }
+    }
+
+    info!(
+        "encoder check: {units} access units, {bytes} bytes for {frames} frames, extradata {} bytes",
+        encoder.sequence_header().len()
+    );
 }
 
 /// Stream geometry, overridable with `VD_VIDEO_SIZE=WxH` and `VD_VIDEO_FPS`.

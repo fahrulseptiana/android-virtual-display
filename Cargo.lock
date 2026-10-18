@@ -2640,6 +2640,7 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "log",
+ "thiserror 2.0.21",
  "uuid",
  "vd-core",
  "windows",

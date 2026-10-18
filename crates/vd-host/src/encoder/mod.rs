@@ -4,4 +4,6 @@
 //! implemented.
 
 #[cfg(windows)]
+pub mod h264;
+#[cfg(windows)]
 pub mod media_foundation;
