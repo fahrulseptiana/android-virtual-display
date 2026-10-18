@@ -3,16 +3,21 @@
 //! This crate is deliberately platform agnostic: the same code is compiled into
 //! the Windows host and into the Android client. It contains
 //!
-//! * [`protocol`] – the wire types exchanged between host and client.
+//! * [`protocol`] – the discovery wire types and [`HostInfo`].
 //! * [`net`] – a tiny transport abstraction ([`net::PacketIo`]) plus a UDP
 //!   implementation, so the discovery logic can be unit tested without a real
 //!   network.
 //! * [`discovery`] – the host *responder* and the client *browser*.
-//! * [`session`] – the control-channel handshake messages.
+//! * [`session`] – the encrypted control channel: handshake, pairing, framing,
+//!   cipher and heartbeats.
+//! * [`video`] – the binary video frame format.
+//! * [`capture`] – the [`FrameSource`] abstraction (and a synthetic test
+//!   pattern) that a real capture backend implements.
 //!
-//! Display/video transport is intentionally **not** implemented yet; only the
-//! discovery handshake and the session message types exist today.
+//! The video **transport** is not wired up yet; the frame format and capture
+//! abstraction exist so it can be built next.
 
+pub mod capture;
 pub mod discovery;
 pub mod error;
 pub mod net;
@@ -23,6 +28,7 @@ pub mod video;
 #[cfg(test)]
 mod test_support;
 
+pub use capture::{CaptureError, CapturedFrame, FrameSource};
 pub use error::{Error, Result};
 pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,
