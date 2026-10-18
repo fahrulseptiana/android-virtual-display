@@ -48,6 +48,8 @@ enum Connection {
     Pairing {
         host: String,
         pin: u32,
+        /// The host was known but presented a different identity key.
+        identity_changed: bool,
     },
     Connected {
         session: Box<Session>,
@@ -79,6 +81,8 @@ pub struct VdClientApp {
     connection: Connection,
     /// The live connection, used to answer pairing requests and to disconnect.
     handle: Option<ConnectionHandle>,
+    /// Where known host identities are remembered.
+    trust_path: Option<std::path::PathBuf>,
     /// Decoded frames waiting to be drawn.
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
@@ -87,9 +91,10 @@ pub struct VdClientApp {
 
 impl VdClientApp {
     /// Creates the app and binds the discovery socket.
-    pub fn new() -> Self {
+    pub fn new(trust_path: Option<std::path::PathBuf>) -> Self {
         let (events_tx, events_rx) = channel();
         let mut app = Self {
+            trust_path,
             view: View::Browser,
             browser: None,
             browser_error: None,
@@ -156,7 +161,15 @@ impl VdClientApp {
         while let Ok(event) = self.events_rx.try_recv() {
             self.connection = match event {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
-                ConnectionEvent::PairingRequired { host, pin } => Connection::Pairing { host, pin },
+                ConnectionEvent::PairingRequired {
+                    host,
+                    pin,
+                    identity_changed,
+                } => Connection::Pairing {
+                    host,
+                    pin,
+                    identity_changed,
+                },
                 ConnectionEvent::Established(session) => {
                     // Straight to full screen once the session is up.
                     self.view = View::Stream;
@@ -220,6 +233,7 @@ impl VdClientApp {
             host,
             self.events_tx.clone(),
             self.frames.clone(),
+            self.trust_path.clone(),
         ));
     }
 
@@ -254,7 +268,7 @@ impl VdClientApp {
 
 impl Default for VdClientApp {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -276,6 +290,9 @@ impl eframe::App for VdClientApp {
             View::Stream => self.show_stream(ui),
             View::Browser => self.show_browser(ui),
         }
+
+        // Works in either view, so a mid-stream reconnect can still be approved.
+        self.show_pairing(ui);
     }
 }
 
@@ -288,7 +305,6 @@ impl VdClientApp {
         let busy = connection.is_busy();
         let error = self.browser_error.clone();
         let mut connect_to: Option<(SocketAddr, HostInfo)> = None;
-        let mut pairing_decision: Option<bool> = None;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x12, 0x12, 0x14)))
@@ -325,50 +341,64 @@ impl VdClientApp {
                 });
             });
 
-        if let Connection::Pairing { host, pin } = connection {
-            egui::Window::new("Pair device")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ui.ctx(), |ui| {
-                    ui.label(format!("Pair with \"{host}\"?"));
-                    ui.add_space(6.0);
-                    ui.heading(format!("{pin:06}"));
-                    ui.label("Confirm this code to start the session.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            pairing_decision = Some(false);
-                        }
-                        if ui.button("Pair").clicked() {
-                            pairing_decision = Some(true);
-                        }
-                    });
-                });
+        if let Some((addr, host)) = connect_to {
+            self.start_connection(addr, host);
         }
+    }
 
-        if let Some(approved) = pairing_decision {
+    /// The pairing prompt, shown whichever view is up.
+    ///
+    /// It has to work while streaming too: a reconnect gives a fresh PIN, and
+    /// without this the client would sit waiting for a decision it never asks
+    /// for.
+    fn show_pairing(&mut self, ui: &mut egui::Ui) {
+        let (host, pin, identity_changed) = match &self.connection {
+            Connection::Pairing {
+                host,
+                pin,
+                identity_changed,
+            } => (host.clone(), *pin, *identity_changed),
+            _ => return,
+        };
+
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Pair device")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Pair with \"{host}\"?"));
+                ui.add_space(6.0);
+                ui.heading(format!("{pin:06}"));
+                ui.label("Confirm this code to start the session.");
+                if identity_changed {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "This host's identity has changed since you last paired.",
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.button("Pair").clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+
+        if let Some(approved) = decision {
             if let Some(handle) = self.handle.as_ref() {
                 handle.decide_pairing(approved);
             }
-            let host = match &self.connection {
-                Connection::Pairing { host, .. } => Some(host.clone()),
-                _ => None,
-            };
-            match (approved, host) {
-                (true, Some(host)) => {
-                    self.connection = Connection::Connecting { host, note: None };
-                }
-                (false, _) => {
-                    self.connection = Connection::Idle;
-                    self.handle = None;
-                }
-                (true, None) => {}
+            if approved {
+                self.connection = Connection::Connecting { host, note: None };
+            } else {
+                self.connection = Connection::Idle;
+                self.handle = None;
             }
-        }
-
-        if let Some((addr, host)) = connect_to {
-            self.start_connection(addr, host);
         }
     }
 
@@ -401,6 +431,45 @@ impl VdClientApp {
                 );
             }
         }
+
+        // Anything but a live session is veiled, so a dropped connection can
+        // never be mistaken for a frozen desktop.
+        if !matches!(self.connection, Connection::Connected { .. }) {
+            let (title, detail) = disconnected_text(&self.connection);
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(200));
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, -14.0),
+                egui::Align2::CENTER_CENTER,
+                title,
+                egui::FontId::proportional(30.0),
+                egui::Color32::from_gray(240),
+            );
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 24.0),
+                egui::Align2::CENTER_CENTER,
+                detail,
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_gray(165),
+            );
+        }
+    }
+}
+
+/// Headline and detail for the disconnected veil.
+fn disconnected_text(connection: &Connection) -> (&'static str, String) {
+    match connection {
+        Connection::Connected { .. } => ("", String::new()),
+        Connection::Idle => ("Disconnected", "The session has ended.".to_owned()),
+        Connection::Connecting { host, note } => (
+            "Disconnected",
+            match note {
+                Some(note) => format!("Reconnecting to {host}… ({note})"),
+                None => format!("Reconnecting to {host}…"),
+            },
+        ),
+        Connection::Pairing { host, .. } => ("Disconnected", format!("Pairing with {host}…")),
+        Connection::Failed { host, reason } => ("Disconnected", format!("{host}: {reason}")),
     }
 }
 
@@ -528,7 +597,10 @@ fn status_line(ui: &mut egui::Ui, connection: &Connection) {
             });
         }
         Connection::Pairing { host, .. } => {
-            ui.label(format!("Waiting to pair with {host}…"));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Pairing with {host}…"));
+            });
         }
         Connection::Connected { session } => {
             ui.label(format!("Connected to {}", session.host.name));
