@@ -21,6 +21,7 @@ pub mod capture;
 pub mod clock;
 pub mod codec;
 pub mod discovery;
+pub mod display;
 pub mod error;
 pub mod latency;
 pub mod net;
@@ -36,6 +37,7 @@ pub use clock::Clock;
 pub use codec::{
     decode_rgba, encode_jpeg, fit_frame, fit_within, CodecError, EncodedImage, RgbaImage,
 };
+pub use display::{DisplayInfo, DisplayKind};
 pub use error::{Error, Result};
 pub use latency::{ClockOffset, ClockSync, SampleStats};
 pub use protocol::{

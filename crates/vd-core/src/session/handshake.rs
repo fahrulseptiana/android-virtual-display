@@ -182,12 +182,17 @@ impl ClientHandshake {
                 Ok(Action::Rejected(reason))
             }
             SessionMessage::Hello { .. }
-            | SessionMessage::VideoConfig { .. }
-            | SessionMessage::VideoControl { .. }
-            | SessionMessage::Ping { .. }
-            | SessionMessage::Pong { .. } => {
+            | SessionMessage::SelectDisplay { .. }
+            | SessionMessage::VideoControl { .. } => {
                 Err(Error::Protocol("host sent a client-only message"))
             }
+            // Host-to-client traffic that belongs to an established session.
+            SessionMessage::VideoConfig { .. }
+            | SessionMessage::Displays { .. }
+            | SessionMessage::Ping { .. }
+            | SessionMessage::Pong { .. } => Err(Error::Protocol(
+                "session message before the handshake finished",
+            )),
         }
     }
 
@@ -319,12 +324,14 @@ impl HostHandshake {
             }
             SessionMessage::Welcome { .. }
             | SessionMessage::Reject { .. }
-            | SessionMessage::VideoConfig { .. } => {
+            | SessionMessage::VideoConfig { .. }
+            | SessionMessage::Displays { .. } => {
                 Err(Error::Protocol("client sent a host-only message"))
             }
             // Client-to-host traffic, which belongs to an established session
             // and has no meaning while one is still being negotiated.
-            SessionMessage::VideoControl { .. }
+            SessionMessage::SelectDisplay { .. }
+            | SessionMessage::VideoControl { .. }
             | SessionMessage::Ping { .. }
             | SessionMessage::Pong { .. } => Err(Error::Protocol(
                 "session message before the handshake finished",

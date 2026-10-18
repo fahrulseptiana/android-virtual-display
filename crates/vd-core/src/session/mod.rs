@@ -34,7 +34,7 @@ use crate::session::pairing::{KEY_LEN, SALT_LEN};
 ///
 /// Independent of [`crate::protocol::PROTOCOL_VERSION`], which version guards the
 /// UDP discovery datagrams.
-pub const SESSION_PROTOCOL_VERSION: u16 = 3;
+pub const SESSION_PROTOCOL_VERSION: u16 = 4;
 
 /// A video codec a peer is able to encode or decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,6 +173,22 @@ pub enum SessionMessage {
         #[serde(default)]
         sent_us: u64,
     },
+    /// Host → client: the display outputs it could capture, and which one it is
+    /// capturing now.
+    ///
+    /// Sent once a session is established so the client can offer a choice, and
+    /// again whenever the choice changes -- so the client learns what the host is
+    /// actually doing rather than assuming its request was honoured.
+    Displays {
+        current: u32,
+        outputs: Vec<crate::display::DisplayInfo>,
+    },
+    /// Client → host: capture this output from now on.
+    ///
+    /// The index comes from the most recent [`SessionMessage::Displays`]. A host
+    /// that cannot switch says so by leaving the list alone and continuing with
+    /// what it has, rather than by failing the session.
+    SelectDisplay { index: u32 },
     /// Client → host: whether it wants video at all.
     ///
     /// Sent when the app goes to the background or comes back, so a host stops
@@ -238,6 +254,8 @@ impl SessionMessage {
             Self::Hello { protocol, .. } | Self::Welcome { protocol, .. } => Some(*protocol),
             Self::Reject { .. }
             | Self::VideoConfig { .. }
+            | Self::Displays { .. }
+            | Self::SelectDisplay { .. }
             | Self::VideoControl { .. }
             | Self::Ping { .. }
             | Self::Pong { .. } => None,
