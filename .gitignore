@@ -16,6 +16,9 @@
 # Native libraries are produced by `cargo ndk`, never committed.
 /android/app/src/main/jniLibs/
 
+# Written by the sandbox on every logon; useful to read, not to keep.
+/sandbox/setup.log
+
 # Editors / OS
 .vscode/
 .DS_Store

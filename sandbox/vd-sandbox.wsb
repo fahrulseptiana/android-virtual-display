@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Windows Sandbox configuration for testing the host, and later a virtual
+    display driver, without touching this machine.
+
+    Launch it by double-clicking this file, or:
+        WindowsSandbox.exe sandbox\vd-sandbox.wsb
+
+    The first launch configures the sandbox for driver testing and restarts it
+    (see setup.ps1); after that it comes up ready.
+
+    HostFolder must be an absolute path. Windows 11 23H2 and later also accept
+    environment variables there, if this ever needs to be portable.
+-->
+<Configuration>
+    <!-- DXGI Desktop Duplication and Media Foundation need a real graphics
+         stack; without this the sandbox has only a basic display. -->
+    <VGpu>Enable</VGpu>
+
+    <!-- Discovery is UDP broadcast and the session is TCP, so the sandbox has
+         to be on the network. Outbound works; reaching in from the tablet does
+         not, because the sandbox sits behind NAT (see README). -->
+    <Networking>Enable</Networking>
+
+    <!-- 2 GB is the documented minimum; 4 is enough for the desktop and the
+         encoder without competing with the host. Raising this is the first
+         thing to try if the sandbox is killed while streaming. -->
+    <MemoryInMB>4096</MemoryInMB>
+
+    <MappedFolders>
+        <MappedFolder>
+            <HostFolder>C:\Users\Irul\Kitchen\android-virtual-display</HostFolder>
+            <SandboxFolder>C:\vd</SandboxFolder>
+            <!-- Writable, so the sandbox can drop logs and a built driver back
+                 into the repo for inspection from the host. -->
+            <ReadOnly>false</ReadOnly>
+        </MappedFolder>
+    </MappedFolders>
+
+    <!-- Runs on every logon. Its first act is to configure and restart. -->
+    <LogonCommand>
+        <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\vd\sandbox\setup.ps1</Command>
+    </LogonCommand>
+</Configuration>
