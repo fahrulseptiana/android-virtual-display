@@ -17,9 +17,10 @@ use crate::session::SessionMessage;
 
 /// Largest frame we are willing to accept.
 ///
-/// Session messages are tiny (a few hundred bytes); the limit exists to reject
-/// a garbled or hostile length prefix instead of allocating wildly.
-pub const MAX_FRAME_LEN: u32 = 64 * 1024;
+/// Control messages are tiny, but video frames travel on the same channel; a
+/// 16 MiB cap comfortably fits a compressed 4K frame while still rejecting a
+/// garbled or hostile length prefix instead of allocating wildly.
+pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Wraps an already-encoded payload in a length prefix.
 pub fn encode_payload(payload: &[u8]) -> Result<Vec<u8>> {

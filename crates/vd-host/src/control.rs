@@ -13,7 +13,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 use log::{debug, info, warn};
-use vd_core::session::channel::Channel;
+use vd_core::session::channel::{Channel, Frame};
 use vd_core::session::cipher::{Role, SessionCipher};
 use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, HostHandshake};
@@ -108,7 +108,9 @@ fn serve(
                 Err(err) => return Err(err.into()),
             };
             let message = match channel.decode(&payload) {
-                Ok(message) => message,
+                Ok(Frame::Control(message)) => message,
+                // Clients never send video; ignore it rather than failing.
+                Ok(Frame::Video(_)) => continue,
                 Err(err) => {
                     warn!("discarding message from {peer}: {err}");
                     return Ok(());

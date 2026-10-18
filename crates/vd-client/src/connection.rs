@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
-use vd_core::session::channel::Channel;
+use vd_core::session::channel::{Channel, Frame};
 use vd_core::session::cipher::{Role, SessionCipher};
 use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, ClientHandshake};
@@ -195,7 +195,9 @@ fn attempt(
                         Err(err) => return Attempt::Disconnected(err.to_string()),
                     };
                     let message = match channel.decode(&payload) {
-                        Ok(message) => message,
+                        Ok(Frame::Control(message)) => message,
+                        // The host only sends video once the stream is wired up.
+                        Ok(Frame::Video(_)) => continue,
                         Err(err) => return Attempt::Disconnected(err.to_string()),
                     };
 
