@@ -84,11 +84,18 @@ fn serve(
     let mut announced = false;
 
     loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            debug!("control connection from {peer} closed");
-            return Ok(());
-        }
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => {
+                debug!("control connection from {peer} closed");
+                return Ok(());
+            }
+            Ok(read) => read,
+            Err(err) if is_disconnect(&err) => {
+                debug!("control connection from {peer} went away: {err}");
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         decoder.push(&buffer[..read]);
 
         while let Some(message) = decoder.next_message()? {
@@ -101,7 +108,12 @@ fn serve(
             let Action::Reply(reply) = handshake.on_message(message)? else {
                 return Err(IoError::new(ErrorKind::InvalidData, "unexpected host action").into());
             };
-            stream.write_all(&frame::encode(&reply)?)?;
+            if let Err(err) = stream.write_all(&frame::encode(&reply)?) {
+                if is_disconnect(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
 
             match handshake.session() {
                 Some(session) if !announced => {
@@ -116,6 +128,17 @@ fn serve(
             }
         }
     }
+}
+
+/// A client that vanished without a clean shutdown is not an error.
+fn is_disconnect(err: &IoError) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 fn log_session(session: &Session, peer: SocketAddr) {
