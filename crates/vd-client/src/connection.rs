@@ -11,7 +11,9 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -84,16 +86,23 @@ pub enum ConnectionEvent {
     Rejected { host: String, reason: RejectReason },
 }
 
-/// The UI's end of a connection: used to answer pairing requests.
+/// The UI's end of a connection: answers pairing requests and can stop the
+/// worker.
 #[derive(Clone, Debug)]
 pub struct ConnectionHandle {
     decisions: Sender<bool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ConnectionHandle {
     /// Approves or rejects the pending pairing request.
     pub fn decide_pairing(&self, approved: bool) {
         let _ = self.decisions.send(approved);
+    }
+
+    /// Stops the connection and any reconnection attempts.
+    pub fn disconnect(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -105,9 +114,12 @@ pub fn connect(
     frames: FrameQueue,
 ) -> ConnectionHandle {
     let (decisions_tx, decisions_rx) = channel();
-    thread::spawn(move || supervise(addr, host, events, decisions_rx, frames));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_flag = cancelled.clone();
+    thread::spawn(move || supervise(addr, host, events, decisions_rx, frames, cancel_flag));
     ConnectionHandle {
         decisions: decisions_tx,
+        cancelled,
     }
 }
 
@@ -119,11 +131,15 @@ fn supervise(
     events: Sender<ConnectionEvent>,
     decisions: Receiver<bool>,
     frames: FrameQueue,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut previous_error: Option<String> = None;
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         debug!("connecting to {}", host.name);
         if events
             .send(ConnectionEvent::Connecting {
@@ -135,7 +151,7 @@ fn supervise(
             return; // the UI is gone
         }
 
-        match attempt(addr, &host.name, &events, &decisions, &frames) {
+        match attempt(addr, &host.name, &events, &decisions, &frames, &cancelled) {
             Attempt::Disconnected(error) => {
                 // We had a session, so retry promptly.
                 warn!("session with {} ended: {error}", host.name);
@@ -173,7 +189,14 @@ fn supervise(
         {
             return;
         }
-        thread::sleep(delay);
+        // Wait out the backoff, but stay responsive to a disconnect.
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -195,6 +218,7 @@ fn attempt(
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
     frames: &FrameQueue,
+    cancelled: &Arc<AtomicBool>,
 ) -> Attempt {
     frames.clear();
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -223,6 +247,9 @@ fn attempt(
     let decode_worker = DecoderWorker::spawn(frames.clone());
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Attempt::Cancelled;
+        }
         let now = Instant::now();
         match stream.read(&mut buffer) {
             Ok(0) => return Attempt::Disconnected("host closed the connection".to_owned()),
@@ -256,9 +283,14 @@ fn attempt(
                     };
 
                     if let Action::AwaitingConfirmation { pin } = action {
-                        let Some(session) =
-                            confirm_pairing(host_name, pin, events, decisions, &mut handshake)
-                        else {
+                        let Some(session) = confirm_pairing(
+                            host_name,
+                            pin,
+                            events,
+                            decisions,
+                            &mut handshake,
+                            cancelled,
+                        ) else {
                             return Attempt::Cancelled;
                         };
                         // Everything after the Welcome is sealed.
@@ -329,6 +361,7 @@ fn confirm_pairing(
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
     handshake: &mut ClientHandshake,
+    cancelled: &Arc<AtomicBool>,
 ) -> Option<Session> {
     info!("pairing with \"{host_name}\" — PIN {pin:06}");
     if events
@@ -341,8 +374,19 @@ fn confirm_pairing(
         return None;
     }
 
-    match decisions.recv() {
-        Ok(true) => {
+    let decision = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        match decisions.recv_timeout(Duration::from_millis(200)) {
+            Ok(approved) => break approved,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    };
+
+    match decision {
+        true => {
             info!("pairing with \"{host_name}\" approved");
             match handshake.confirm() {
                 Ok(Action::Established(session)) => {
@@ -361,11 +405,10 @@ fn confirm_pairing(
                 }
             }
         }
-        Ok(false) => {
+        false => {
             info!("pairing with \"{host_name}\" rejected by the user");
             None
         }
-        Err(_) => None, // the UI is gone
     }
 }
 
