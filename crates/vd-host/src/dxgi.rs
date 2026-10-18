@@ -18,11 +18,21 @@ use log::{debug, info};
 use vd_core::capture::{CaptureError, CapturedFrame, FrameSource};
 use vd_core::video::FrameFormat;
 use windows::core::Interface;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0,
+};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+};
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MORE_DATA, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -45,6 +55,197 @@ struct CursorShape {
     pitch: u32,
     hotspot: (i32, i32),
     pixels: Vec<u8>,
+}
+
+/// A display output DXGI can see, and the adapter that drives it.
+///
+/// The adapter matters because DXGI enumerates outputs *per adapter*, and an
+/// indirect display driver reports an adapter of its own. A virtual monitor
+/// therefore does not appear among the outputs of the GPU the rest of the
+/// pipeline uses, which is what makes "capture it like any other screen" a
+/// question rather than an assumption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayOutput {
+    /// Index into the adapter list.
+    pub adapter: u32,
+    /// Index into that adapter's own outputs.
+    pub output: u32,
+    /// The adapter's description, e.g. "AMD Radeon(TM) 8060S Graphics".
+    pub adapter_name: String,
+    /// The name Windows gives the monitor, e.g. `\.\DISPLAY2`.
+    pub device_name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Whether the output has a desktop on it at all.
+    pub attached: bool,
+}
+
+/// An adapter DXGI will enumerate, and how many outputs it reports.
+///
+/// Separated from [`enumerate_outputs`] because "the adapter is not there" and
+/// "the adapter is there but has no outputs" mean different things, and an
+/// indirect display driver can produce either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayAdapter {
+    pub index: u32,
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    /// Whether DXGI flags this as a software adapter.
+    pub software: bool,
+    pub outputs: u32,
+}
+
+/// Every adapter DXGI will enumerate, whether or not it has outputs.
+pub fn enumerate_adapters() -> Result<Vec<DisplayAdapter>, CaptureError> {
+    // SAFETY: plain enumeration; nothing outlives the factory.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|err| CaptureError::Unavailable(format!("CreateDXGIFactory1: {err}")))?;
+
+        let mut found = Vec::new();
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            let mut outputs = 0;
+            while adapter.EnumOutputs(outputs).is_ok() {
+                outputs += 1;
+            }
+            match adapter.GetDesc1() {
+                Ok(desc) => found.push(DisplayAdapter {
+                    index,
+                    name: wide_to_string(&desc.Description),
+                    vendor_id: desc.VendorId,
+                    device_id: desc.DeviceId,
+                    software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                    outputs,
+                }),
+                Err(err) => debug!("adapter {index} has no description: {err}"),
+            }
+            index += 1;
+        }
+        Ok(found)
+    }
+}
+
+/// Every output of every adapter, in enumeration order.
+pub fn enumerate_outputs() -> Result<Vec<DisplayOutput>, CaptureError> {
+    // SAFETY: plain enumeration; each interface is used within the call that
+    // obtained it and nothing outlives the factory.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|err| CaptureError::Unavailable(format!("CreateDXGIFactory1: {err}")))?;
+
+        let mut found = Vec::new();
+        let mut adapter_index = 0;
+        // Running off the end of either list is how DXGI says "no more".
+        while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
+            let adapter_name = adapter_description(&adapter);
+            let mut output_index = 0;
+            while let Ok(output) = adapter.EnumOutputs(output_index) {
+                match output.GetDesc() {
+                    Ok(desc) => found.push(DisplayOutput {
+                        adapter: adapter_index,
+                        output: output_index,
+                        adapter_name: adapter_name.clone(),
+                        device_name: wide_to_string(&desc.DeviceName),
+                        width: (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).max(0)
+                            as u32,
+                        height: (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top)
+                            .max(0) as u32,
+                        attached: desc.AttachedToDesktop.as_bool(),
+                    }),
+                    Err(err) => {
+                        debug!("output {adapter_index}:{output_index} has no description: {err}")
+                    }
+                }
+                output_index += 1;
+            }
+            adapter_index += 1;
+        }
+        Ok(found)
+    }
+}
+
+/// Whether Desktop Duplication can be created for one output, and at what size.
+///
+/// The result decides whether a virtual monitor is just another screen to the
+/// capture path or needs a different backend. The failure is returned rather than
+/// logged because "it does not work" is not much use without the reason.
+pub fn probe_duplication(
+    adapter_index: u32,
+    output_index: u32,
+) -> Result<(u32, u32), CaptureError> {
+    // SAFETY: enumeration and a device created on the adapter that owns the
+    // output; both are used only here.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|err| CaptureError::Unavailable(format!("CreateDXGIFactory1: {err}")))?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(adapter_index).map_err(|err| {
+            CaptureError::Unavailable(format!("EnumAdapters1({adapter_index}): {err}"))
+        })?;
+        let output = adapter.EnumOutputs(output_index).map_err(|err| {
+            CaptureError::Unavailable(format!("EnumOutputs({output_index}): {err}"))
+        })?;
+        let output: IDXGIOutput1 = output
+            .cast()
+            .map_err(|err| CaptureError::Unavailable(format!("IDXGIOutput1: {err}")))?;
+
+        // A device of its own, on this adapter: duplication belongs to the
+        // adapter that owns the output, so the shared device cannot be reused.
+        // Handing D3D11CreateDevice an adapter requires DRIVER_TYPE_UNKNOWN,
+        // since a driver type and an adapter are mutually exclusive.
+        // D3D11CreateDevice takes the base interface, not `1`.
+        let adapter_for_device: IDXGIAdapter = adapter
+            .cast()
+            .map_err(|err| CaptureError::Unavailable(format!("IDXGIAdapter: {err}")))?;
+        let mut device = None;
+        let mut context = None;
+        D3D11CreateDevice(
+            Some(&adapter_for_device),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[
+                D3D_FEATURE_LEVEL_11_0,
+                D3D_FEATURE_LEVEL_10_1,
+                D3D_FEATURE_LEVEL_10_0,
+            ]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .map_err(|err| {
+            CaptureError::Unavailable(format!(
+                "D3D11CreateDevice on adapter {adapter_index}: {err}"
+            ))
+        })?;
+
+        let device =
+            device.ok_or_else(|| CaptureError::Unavailable("no D3D11 device".to_owned()))?;
+        let duplication = output
+            .DuplicateOutput(&device)
+            .map_err(|err| CaptureError::Unavailable(format!("DuplicateOutput: {err}")))?;
+        let desc = duplication.GetDesc();
+        Ok((desc.ModeDesc.Width, desc.ModeDesc.Height))
+    }
+}
+
+/// An adapter's friendly name, from its wide-string description.
+fn adapter_description(adapter: &IDXGIAdapter1) -> String {
+    // SAFETY: GetDesc fills a struct this function owns.
+    unsafe {
+        adapter
+            .GetDesc1()
+            .map(|desc| wide_to_string(&desc.Description))
+            .unwrap_or_else(|_| "<unknown adapter>".to_owned())
+    }
+}
+
+/// Trims a NUL-terminated wide string out of a fixed-size field.
+fn wide_to_string(wide: &[u16]) -> String {
+    let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..end])
 }
 
 /// The mouse pointer.

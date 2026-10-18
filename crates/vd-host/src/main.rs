@@ -46,6 +46,15 @@ const INSTANCE_MUTEX: &str = "id.fahrul.vd.host";
 fn main() -> vd_core::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Before anything binds a port or takes the single-instance guard: this is a
+    // question about the machine, not a session, and it should answer even while
+    // a host is already running.
+    #[cfg(windows)]
+    if std::env::var_os("VD_LIST_OUTPUTS").is_some() {
+        list_outputs();
+        return Ok(());
+    }
+
     // A second host would fight the first over the discovery and control ports,
     // and would announce the same machine twice.
     #[cfg(windows)]
@@ -135,6 +144,55 @@ fn main() -> vd_core::Result<()> {
     running.store(false, Ordering::Relaxed);
     let _ = services.join();
     Ok(())
+}
+
+/// Prints every display output, and whether Desktop Duplication works on it.
+///
+/// A diagnostic rather than a feature, and the answer to a question that matters
+/// more than any other for virtual displays: DXGI enumerates outputs *per
+/// adapter*, and an indirect display driver reports an adapter of its own, so a
+/// monitor added by one is invisible to anything that only looks at the GPU.
+#[cfg(windows)]
+fn list_outputs() {
+    match dxgi::enumerate_adapters() {
+        Ok(adapters) => {
+            for adapter in &adapters {
+                println!(
+                    "adapter {} \"{}\" vendor={:#06x} device={:#06x} software={} outputs={}",
+                    adapter.index,
+                    adapter.name,
+                    adapter.vendor_id,
+                    adapter.device_id,
+                    adapter.software,
+                    adapter.outputs,
+                );
+            }
+        }
+        Err(err) => eprintln!("could not enumerate adapters: {err}"),
+    }
+
+    match dxgi::enumerate_outputs() {
+        Ok(outputs) if outputs.is_empty() => println!("no outputs found"),
+        Ok(outputs) => {
+            for (index, output) in outputs.iter().enumerate() {
+                let verdict = match dxgi::probe_duplication(output.adapter, output.output) {
+                    Ok((width, height)) => format!("duplication ok, {width}x{height}"),
+                    Err(err) => format!("duplication FAILED: {err}"),
+                };
+                println!(
+                    "[{index}] adapter {} ({}) output {} ({}) {}x{} attached={} -> {verdict}",
+                    output.adapter,
+                    output.adapter_name,
+                    output.output,
+                    output.device_name,
+                    output.width,
+                    output.height,
+                    output.attached,
+                );
+            }
+        }
+        Err(err) => eprintln!("could not enumerate outputs: {err}"),
+    }
 }
 
 /// Shows the tray icon and waits until the host is asked to stop.
