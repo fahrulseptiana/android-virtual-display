@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
-use vd_core::{HostInfo, RejectReason, Session};
+use vd_core::{HostId, HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
 use crate::frames::FrameQueue;
@@ -87,6 +87,9 @@ pub struct VdClientApp {
     handle: Option<ConnectionHandle>,
     /// Where known host identities are remembered.
     trust_path: Option<std::path::PathBuf>,
+    /// The host we are currently trying to reach, so discovery can tell us the
+    /// moment it comes back.
+    retry_target: Option<HostId>,
     /// Decoded frames waiting to be drawn.
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
@@ -98,6 +101,7 @@ impl VdClientApp {
     pub fn new(trust_path: Option<std::path::PathBuf>) -> Self {
         let mut app = Self {
             trust_path,
+            retry_target: None,
             view: View::Browser,
             browser: None,
             browser_error: None,
@@ -176,6 +180,7 @@ impl VdClientApp {
                     identity_changed,
                 },
                 ConnectionEvent::Established(session) => {
+                    self.retry_target = None;
                     // Straight to full screen once the session is up.
                     self.view = View::Stream;
                     Connection::Connected { session }
@@ -223,6 +228,7 @@ impl VdClientApp {
         // Dropping the receiver also tells the worker to stop: its next send
         // fails, and it exits rather than retrying behind the user's back.
         self.events_rx = None;
+        self.retry_target = None;
         self.connection = Connection::Idle;
         self.view = View::Browser;
         self.frames.clear();
@@ -234,6 +240,7 @@ impl VdClientApp {
             host: host.name.clone(),
             note: None,
         };
+        self.retry_target = Some(host.id.clone());
         self.frames.clear();
         self.texture = None;
 
@@ -267,6 +274,33 @@ impl VdClientApp {
         *last = Instant::now();
     }
 
+    /// Skips the rest of a retry delay when discovery shows the host is back.
+    ///
+    /// The client keeps probing for hosts whatever view it is on, so it usually
+    /// learns that a restarted host is up within a couple of seconds — well
+    /// before a backoff would have expired. There is no reason to wait.
+    fn nudge_reconnect(&mut self) {
+        if !matches!(self.connection, Connection::Connecting { .. }) {
+            return;
+        }
+        let Some(target) = self.retry_target.clone() else {
+            return;
+        };
+        let Some(browser) = self.browser.as_ref() else {
+            return;
+        };
+
+        let now = Instant::now();
+        let back_online = browser
+            .hosts()
+            .any(|host| host.info.id == target && host.age(now) < ONLINE_WINDOW);
+        if back_online {
+            if let Some(handle) = self.handle.as_ref() {
+                handle.retry_now();
+            }
+        }
+    }
+
     /// The host list, newest information first.
     fn hosts(&self) -> Vec<DiscoveredHost> {
         let mut hosts: Vec<DiscoveredHost> = self
@@ -288,6 +322,7 @@ impl Default for VdClientApp {
 impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_discovery();
+        self.nudge_reconnect();
         self.poll_connection();
         self.refresh_texture(ui.ctx());
         self.report_rates();

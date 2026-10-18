@@ -98,12 +98,22 @@ pub enum ConnectionEvent {
     Rejected { host: String, reason: RejectReason },
 }
 
+/// The two signals the UI can send a running worker.
+#[derive(Clone)]
+struct WorkerControl {
+    /// Stop the connection and any reconnection attempts.
+    cancelled: Arc<AtomicBool>,
+    /// Skip the rest of the current backoff.
+    retry: Arc<AtomicBool>,
+}
+
 /// The UI's end of a connection: answers pairing requests and can stop the
 /// worker.
 #[derive(Clone, Debug)]
 pub struct ConnectionHandle {
     decisions: Sender<bool>,
     cancelled: Arc<AtomicBool>,
+    retry: Arc<AtomicBool>,
 }
 
 impl ConnectionHandle {
@@ -116,6 +126,14 @@ impl ConnectionHandle {
     pub fn disconnect(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
+
+    /// Skips whatever is left of the current backoff.
+    ///
+    /// The UI calls this when discovery shows the host is back: there is no
+    /// reason to sit out a delay that exists only because the host was down.
+    pub fn retry_now(&self) {
+        self.retry.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Spawns a thread that keeps a session to `host` alive, reconnecting as needed.
@@ -126,9 +144,13 @@ pub fn connect(
     frames: FrameQueue,
     trust_path: Option<std::path::PathBuf>,
 ) -> ConnectionHandle {
-    let (decisions_tx, decisions_rx) = channel();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_flag = cancelled.clone();
+    let retry = Arc::new(AtomicBool::new(false));
+    let (decisions_tx, decisions_rx) = channel();
+    let control = WorkerControl {
+        cancelled: cancelled.clone(),
+        retry: retry.clone(),
+    };
     thread::spawn(move || {
         supervise(
             addr,
@@ -136,13 +158,14 @@ pub fn connect(
             events,
             decisions_rx,
             frames,
-            cancel_flag,
+            control,
             trust_path,
         )
     });
     ConnectionHandle {
         decisions: decisions_tx,
         cancelled,
+        retry,
     }
 }
 
@@ -154,7 +177,7 @@ fn supervise(
     events: Sender<ConnectionEvent>,
     decisions: Receiver<bool>,
     frames: FrameQueue,
-    cancelled: Arc<AtomicBool>,
+    control: WorkerControl,
     trust_path: Option<std::path::PathBuf>,
 ) {
     // Loaded once for the lifetime of the worker: this store is what makes a
@@ -164,7 +187,7 @@ fn supervise(
     let mut previous_error: Option<String> = None;
 
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if control.cancelled.load(Ordering::Relaxed) {
             return;
         }
         debug!("connecting to {}", host.name);
@@ -179,7 +202,7 @@ fn supervise(
         }
 
         match attempt(
-            addr, &host.name, &events, &decisions, &frames, &cancelled, &mut trust,
+            addr, &host.name, &events, &decisions, &frames, &control, &mut trust,
         ) {
             Attempt::Disconnected(error) => {
                 // We had a session, so try again immediately: the usual reason
@@ -227,13 +250,18 @@ fn supervise(
         {
             return;
         }
-        // Wait out the backoff, but stay responsive to a disconnect.
+        // Wait out the backoff, but stay responsive to a disconnect — and to
+        // the host reappearing, which makes the rest of the wait pointless.
         let deadline = Instant::now() + delay;
         while Instant::now() < deadline {
-            if cancelled.load(Ordering::Relaxed) {
+            if control.cancelled.load(Ordering::Relaxed) {
                 return;
             }
-            thread::sleep(Duration::from_millis(50));
+            if control.retry.swap(false, Ordering::Relaxed) {
+                debug!("retrying now: discovery says the host is back");
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
         }
     }
 }
@@ -256,7 +284,7 @@ fn attempt(
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
     frames: &FrameQueue,
-    cancelled: &Arc<AtomicBool>,
+    control: &WorkerControl,
     trust: &mut TrustStore,
 ) -> Attempt {
     frames.clear();
@@ -286,7 +314,7 @@ fn attempt(
     let decode_worker = DecoderWorker::spawn(frames.clone());
 
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if control.cancelled.load(Ordering::Relaxed) {
             return Attempt::Cancelled;
         }
         let now = Instant::now();
@@ -338,7 +366,7 @@ fn attempt(
                             decisions,
                             &mut handshake,
                             trust,
-                            cancelled,
+                            control,
                         ) else {
                             return Attempt::Cancelled;
                         };
@@ -414,7 +442,7 @@ fn confirm_pairing(
     decisions: &Receiver<bool>,
     handshake: &mut ClientHandshake,
     trust: &mut TrustStore,
-    cancelled: &Arc<AtomicBool>,
+    control: &WorkerControl,
 ) -> Option<Session> {
     let trusted = identity
         .as_ref()
@@ -446,7 +474,7 @@ fn confirm_pairing(
         }
 
         let decision = loop {
-            if cancelled.load(Ordering::Relaxed) {
+            if control.cancelled.load(Ordering::Relaxed) {
                 return None;
             }
             match decisions.recv_timeout(Duration::from_millis(200)) {
