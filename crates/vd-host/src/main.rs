@@ -18,6 +18,8 @@ mod control;
 mod dxgi;
 #[cfg(windows)]
 mod encoder;
+#[cfg(windows)]
+mod gpu;
 mod identity;
 mod video;
 
@@ -106,9 +108,17 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
-        match dxgi::DxgiCapture::new(output) {
-            Ok(capture) => return Box::new(capture),
-            Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
+
+        // Capture and (later) encoding share one device so frames never cross
+        // GPU boundaries.
+        match gpu::create_device() {
+            Ok(gpu) => {
+                match dxgi::DxgiCapture::new(gpu.device.clone(), gpu.context.clone(), output) {
+                    Ok(capture) => return Box::new(capture),
+                    Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
+                }
+            }
+            Err(err) => warn!("{err}; using the test pattern"),
         }
     }
     Box::new(TestPattern::new(width, height))

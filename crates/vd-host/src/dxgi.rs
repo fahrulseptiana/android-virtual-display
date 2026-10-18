@@ -18,15 +18,9 @@ use log::{debug, info};
 use vd_core::capture::{CaptureError, CapturedFrame, FrameSource};
 use vd_core::video::FrameFormat;
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
-    D3D_FEATURE_LEVEL_11_0,
-};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -55,40 +49,23 @@ pub struct DxgiCapture {
 }
 
 impl DxgiCapture {
-    /// Attaches to `output_index` (0 is the primary monitor).
-    pub fn new(output_index: u32) -> Result<Self, CaptureError> {
+    /// Attaches to `output_index` (0 is the primary monitor) on the shared device.
+    pub fn new(
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        output_index: u32,
+    ) -> Result<Self, CaptureError> {
         // SAFETY: every call below is a documented D3D/DXGI call; the returned
         // interfaces are owned for the lifetime of `self` and only used from the
         // capture thread.
-        unsafe { Self::create(output_index) }
+        unsafe { Self::create(device, context, output_index) }
     }
 
-    unsafe fn create(output_index: u32) -> Result<Self, CaptureError> {
-        let mut device = None;
-        let mut context = None;
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&[
-                D3D_FEATURE_LEVEL_11_0,
-                D3D_FEATURE_LEVEL_10_1,
-                D3D_FEATURE_LEVEL_10_0,
-            ]),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )
-        .map_err(|err| CaptureError::Unavailable(format!("D3D11CreateDevice: {err}")))?;
-
-        let device = device
-            .ok_or_else(|| CaptureError::Unavailable("no D3D11 device was created".to_owned()))?;
-        let context = context.ok_or_else(|| {
-            CaptureError::Unavailable("no D3D11 immediate context was created".to_owned())
-        })?;
-
+    unsafe fn create(
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        output_index: u32,
+    ) -> Result<Self, CaptureError> {
         let dxgi_device: IDXGIDevice = device
             .cast()
             .map_err(|err| CaptureError::Unavailable(format!("IDXGIDevice: {err}")))?;
