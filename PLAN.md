@@ -387,19 +387,20 @@ rather than reasoned about:
    root-enumerated, so `pnputil` stages the package but `devcon` has to create the
    device node. A reboot finishes it.
 
-- [ ] **Step 1 — stream any display, virtual ones included.** List every output of
-      every adapter, let the client pick, and let mirror versus extend fall out of
-      which is chosen. This *is* the feature, and the enumeration is written:
-      `VD_LIST_OUTPUTS` reports adapters and outputs, and `VD_OUTPUT` already
-      selects one.
-- [ ] **Step 2 — choose it from the tablet.** The list is the host's; the choosing
-      should be the client's, over the control channel, with the choice remembered
-      per host.
-- [ ] **Step 3 — fit the tablet.** Offer a mode matching the client's panel, so
-      the geometry is exact and nothing is letterboxed. VDD takes its mode list
-      from `vdd_settings.xml`, which `scripts/install-vdd.ps1` already writes with
-      1920x1200 first, so this is a configuration question rather than a driver
-      one.
+- [x] **Step 1 — stream any display, virtual ones included.** The host lists
+      every output of every adapter, and the capture thread swaps sources at
+      runtime, so a virtual monitor is just another output to pick.
+      `VD_LIST_OUTPUTS` prints the list by hand.
+- [x] **Step 2 — choose it from the tablet.** Two buttons over the stream: mirror
+      the screen the host is using, or extend onto the monitor its virtual
+      display driver added. The host answers a selection with a fresh list, so the
+      highlight follows what is being captured rather than what was asked for.
+      Remembering the choice per host, and offering it before the stream starts
+      rather than over it, are the obvious refinements.
+- [x] **Step 3 — fit the tablet.** `scripts/install-vdd.ps1` writes
+      `vdd_settings.xml` with 1920x1200 first, the tablet's panel in landscape, so
+      the monitor is created at the size the client has. Measured: streaming it
+      costs 0 ms of scaling against 17 ms to scale it down to 1280x800.
 - [ ] **Step 4 — a monitor per client**, so two tablets can have a screen each.
       Beyond the current one-viewer-per-host non-goal, so it waits on revisiting
       that rather than on anything here.
