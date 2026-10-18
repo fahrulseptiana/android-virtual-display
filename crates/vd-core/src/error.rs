@@ -14,6 +14,10 @@ pub enum Error {
     /// A peer announced a protocol newer than we understand.
     #[error("unsupported protocol version: peer={peer}, local={local}")]
     UnsupportedVersion { peer: u16, local: u16 },
+
+    /// A frame declared a length we refuse to buffer.
+    #[error("frame too large: {len} bytes (max {max})")]
+    FrameTooLarge { len: u32, max: u32 },
 }
 
 /// Convenience alias used throughout the crate.

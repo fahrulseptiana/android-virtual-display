@@ -27,6 +27,7 @@ pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,
     DEFAULT_DISCOVERY_PORT, PROTOCOL_VERSION,
 };
+pub use session::frame::{FrameDecoder, MAX_FRAME_LEN};
 pub use session::{
     Capabilities, ClientInfo, InputCapabilities, RejectReason, SessionMessage, VideoCodec,
     SESSION_PROTOCOL_VERSION,

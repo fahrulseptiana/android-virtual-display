@@ -18,6 +18,8 @@
 //! message set here is intentionally small and forward-compatible (unknown
 //! fields carry defaults).
 
+pub mod frame;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{HostInfo, Platform};
