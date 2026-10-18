@@ -18,6 +18,7 @@ pub mod error;
 pub mod net;
 pub mod protocol;
 pub mod session;
+pub mod video;
 
 #[cfg(test)]
 mod test_support;
@@ -37,3 +38,4 @@ pub use session::{
     Capabilities, ClientInfo, InputCapabilities, RejectReason, SessionMessage, VideoCodec,
     SESSION_PROTOCOL_VERSION,
 };
+pub use video::{FrameFormat, FrameHeader, VideoFrame, HEADER_LEN, VIDEO_VERSION};
