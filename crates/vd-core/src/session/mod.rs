@@ -21,6 +21,7 @@
 pub mod frame;
 pub mod handshake;
 pub mod heartbeat;
+pub mod pairing;
 
 use serde::{Deserialize, Serialize};
 

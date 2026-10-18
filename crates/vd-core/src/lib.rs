@@ -30,6 +30,7 @@ pub use protocol::{
 pub use session::frame::{FrameDecoder, MAX_FRAME_LEN};
 pub use session::handshake::{Action, ClientHandshake, HostHandshake, Session, State};
 pub use session::heartbeat::{Heartbeat, HeartbeatAction};
+pub use session::pairing::{EphemeralKey, PairingKeys};
 pub use session::{
     Capabilities, ClientInfo, InputCapabilities, RejectReason, SessionMessage, VideoCodec,
     SESSION_PROTOCOL_VERSION,

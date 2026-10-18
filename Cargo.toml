@@ -17,6 +17,13 @@ serde_json = "1"
 thiserror = "2"
 log = "0.4"
 
+# Pairing / control-channel crypto (pure Rust, Android-friendly).
+x25519-dalek = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+getrandom = "0.3"
+
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu"] }
 winit = { version = "0.30", default-features = false }
 

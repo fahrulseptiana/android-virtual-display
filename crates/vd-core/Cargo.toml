@@ -11,5 +11,10 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+x25519-dalek.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]

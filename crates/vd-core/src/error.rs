@@ -22,6 +22,10 @@ pub enum Error {
     /// A peer sent a message that is not valid for the current state.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
+
+    /// The operating system's random source was unavailable.
+    #[error("could not obtain system entropy")]
+    Entropy,
 }
 
 /// Convenience alias used throughout the crate.
