@@ -206,7 +206,10 @@ protected, because a different key is challenged.
       queue. Falls back to the software encoder automatically.
 - [ ] **Zero-copy input.** Scale and convert to NV12 with the **D3D11 Video
       Processor** and hand the encoder a D3D11 texture, removing the 33 MB
-      readback and the ~23 ms CPU downscale. Two things have to be settled
+      readback and the CPU downscale. Measurement in Phase 5 put that downscale
+      at **23 ms of the 32 ms** the host spends per frame, which makes this the
+      single largest win left in the pipeline — bigger than the whole network.
+      ToDo: Two things have to be settled
       first, which is why it is not simply a matter of swapping the scaler:
       * the **cursor** is currently blended into the CPU BGRA buffer, and a
         zero-copy path never has that buffer — so it must either be composited
@@ -239,14 +242,49 @@ negotiation from Phase 2.
 - [x] Frame dropping rather than queueing: the host's fan-out gives each client
       a single slot, and the client's decode queue and frame queue are bounded,
       so a slow link degrades by dropping frames.
-- [ ] **Then:** evaluate an unreliable, ordered datagram transport (QUIC or
-      custom UDP + FEC) with real latency data. Wi-Fi does not need TCP's
-      head-of-line blocking for video.
-- [ ] Measure glass-to-glass latency; nothing reports it yet, so the < 50 ms
-      budget is still unverified.
+- [x] Latency is measured rather than assumed. The host stamps every frame from
+      one clock, `Ping`/`Pong` carry clock readings, and the client derives the
+      offset between the two clocks the way NTP does. It subtracts the host's
+      own share to leave the network's. Reported every 5 s as mean/p95/worst.
+- [x] **Evaluated, and decided against.** A datagram transport would address a
+      smaller share of the latency than the host's own scaling does. See below.
 
-> Keep the transport behind a trait so Phase 5 can replace TCP without touching
-> capture, encode, decode or UI.
+> The original note here read "keep the transport behind a trait so Phase 5 can
+> replace TCP without touching capture, encode, decode or UI". The measurement
+> above answered the question the trait existed to defer, so the trait was never
+> written: an abstraction with one implementation and no concrete second one is
+> just a place for the wiring to hide. The seam that does exist is the framing
+> layer (`session::frame`), which is pure and works on byte slices, so it can
+> already be driven by any stream — including a datagram-shaped one.
+
+#### Transport decision: TCP stays
+
+Measured at 720p30, capture 3840x2160, Ryzen AI MAX+ 395 → iPlay60 mini Pro over
+Wi-Fi. "Client" is the age of a frame when it *arrives*, so it covers capture,
+encode, transport and delivery — not decode, render or panel scan-out.
+
+| Stage | Loopback | Wi-Fi |
+|-------|----------|-------|
+| Host: scale 4K→720p | 23 ms | 23 ms |
+| Host: encode | 4 ms | 4 ms |
+| Host: capture → socket write | 32.3 ms | 32.7 ms |
+| Host: the write itself | 0.2 ms | **0.1 ms** |
+| Client: frame age on arrival | 32.7 ms | 40.7 ms |
+| — of which network | 0.4 ms | **~8 ms** |
+
+Mean 40.7 ms, p95 48 ms, worst 73-86 ms, 28-29 fps, no duplicated or reordered
+frames observed.
+
+The transport is not where the time goes. A socket write of 0.1 ms means the
+window never fills, so there is no head-of-line blocking to remove; the queue
+ahead of the write does not grow either. Meanwhile 23 ms of every 32 ms the host
+spends is CPU scaling a 33 MB BGRA 4K frame down to 720p. Replacing TCP would
+chase the 8 ms while the 23 ms sits untouched — and QUIC or FEC adds its own
+overhead, plus a congestion-control implementation to get wrong.
+
+Revisit if the host-side scaling is ever moved to the GPU: at that point the
+network would be the largest single term, and the 73-86 ms tail would be worth
+attacking directly.
 
 ### Phase 6 — Android decode + render
 
@@ -317,16 +355,19 @@ limitation in Phase 2. Plan:
 
 ### Performance budgets (1080p60)
 
-| Stage | Budget |
-|-------|--------|
-| Capture | < 5 ms |
-| Encode | < 10 ms |
-| Network (LAN) | < 5 ms |
-| Decode | < 10 ms |
-| Render | < 5 ms |
-| **Total** | **< 50 ms** |
+| Stage | Budget | Measured (720p30, Wi-Fi) |
+|-------|--------|--------------------------|
+| Capture + scale | < 5 ms | ~28 ms (23 ms of it the 4K→720p downscale) |
+| Encode | < 10 ms | 4 ms (hardware) |
+| Network (LAN) | < 5 ms | ~8 ms |
+| Decode | < 10 ms | not yet measured |
+| Render | < 5 ms | not yet measured |
+| **Total** | **< 50 ms** | 40.7 ms mean, 48 ms p95 on arrival |
 
-Instrumentation ships from Phase 3 onward so regressions are visible.
+Instrumentation ships from Phase 3 onward so regressions are visible. The
+measured column covers only up to the frame *arriving*; decode, render and panel
+scan-out are still unmeasured, so the true glass-to-glass figure is higher than
+the one above.
 
 ### Testing
 
