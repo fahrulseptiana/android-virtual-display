@@ -146,6 +146,8 @@ pub enum SessionMessage {
         capabilities: Capabilities,
         /// Host's ephemeral X25519 public key.
         host_public: [u8; KEY_LEN],
+        /// Host's long-lived identity key, the basis of trust on first use.
+        identity_public: [u8; KEY_LEN],
         /// Public salt for the key derivation.
         salt: [u8; SALT_LEN],
         /// Host key-confirmation tag over the handshake transcript.
@@ -189,6 +191,7 @@ impl SessionMessage {
         host: HostInfo,
         capabilities: Capabilities,
         host_public: [u8; KEY_LEN],
+        identity_public: [u8; KEY_LEN],
         salt: [u8; SALT_LEN],
         tag: [u8; KEY_LEN],
     ) -> Self {
@@ -197,6 +200,7 @@ impl SessionMessage {
             host,
             capabilities,
             host_public,
+            identity_public,
             salt,
             tag,
         }
@@ -256,6 +260,7 @@ mod tests {
             host,
             caps(),
             [2u8; KEY_LEN],
+            [5u8; KEY_LEN],
             [3u8; SALT_LEN],
             [4u8; KEY_LEN],
         );

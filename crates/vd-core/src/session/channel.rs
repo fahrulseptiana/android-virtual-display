@@ -27,7 +27,11 @@ const KIND_VIDEO: u8 = 0x02;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     /// A control message.
-    Control(SessionMessage),
+    ///
+    /// Boxed because `SessionMessage` carries fixed-size keys and is several
+    /// times larger than a video frame's header; without this every `Frame`
+    /// would be sized for the rarer case.
+    Control(Box<SessionMessage>),
     /// A video frame.
     Video(VideoFrame),
 }
@@ -82,9 +86,9 @@ impl Channel {
             return Err(Error::Malformed("empty frame"));
         };
         match *kind {
-            KIND_CONTROL => Ok(Frame::Control(
+            KIND_CONTROL => Ok(Frame::Control(Box::new(
                 serde_json::from_slice(body).map_err(|_| Error::Malformed("json decode"))?,
-            )),
+            ))),
             KIND_VIDEO => Ok(Frame::Video(VideoFrame::decode(body)?)),
             _ => Err(Error::Malformed("unknown frame kind")),
         }
@@ -133,7 +137,7 @@ mod tests {
         let frame = channel.encode(&SessionMessage::Ping).unwrap();
         assert_eq!(
             decode(&mut channel, frame),
-            Frame::Control(SessionMessage::Ping)
+            Frame::Control(Box::new(SessionMessage::Ping))
         );
     }
 
@@ -156,7 +160,7 @@ mod tests {
         let message = client.encode(&SessionMessage::Ping).unwrap();
         assert_eq!(
             decode(&mut host, message),
-            Frame::Control(SessionMessage::Ping)
+            Frame::Control(Box::new(SessionMessage::Ping))
         );
 
         // The host is the one that sends video.

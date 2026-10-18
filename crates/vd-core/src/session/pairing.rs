@@ -75,6 +75,26 @@ pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
     Ok(salt)
 }
 
+/// Generates a fresh 32-byte secret from the operating system's entropy source.
+///
+/// Used for the host's long-lived identity key, which must therefore be stored
+/// somewhere durable.
+pub fn generate_secret() -> Result<[u8; KEY_LEN]> {
+    let mut secret = [0u8; KEY_LEN];
+    getrandom::fill(&mut secret).map_err(|_| Error::Entropy)?;
+    Ok(secret)
+}
+
+/// The public half of a raw X25519 secret.
+pub fn public_from_secret(secret: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    x25519_dalek::x25519(*secret, x25519_dalek::X25519_BASEPOINT_BYTES)
+}
+
+/// A raw X25519 Diffie-Hellman with a long-lived secret.
+pub fn shared_with_secret(secret: &[u8; KEY_LEN], peer_public: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    x25519_dalek::x25519(*secret, *peer_public)
+}
+
 /// The session key and PIN derived from a shared secret.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingKeys {
@@ -94,9 +114,21 @@ impl std::fmt::Debug for PairingKeys {
 }
 
 impl PairingKeys {
-    /// Derives the session key and PIN from a shared secret and public salt.
-    pub fn derive(shared: &[u8; KEY_LEN], salt: &[u8; SALT_LEN]) -> Self {
-        let hkdf = Hkdf::<Sha256>::new(Some(salt), shared);
+    /// Derives the session key and PIN from the two Diffie-Hellman results.
+    ///
+    /// `shared` is ephemeral-to-ephemeral and gives forward secrecy.
+    /// `authenticated` mixes in the host's long-lived identity key, so only a
+    /// host holding that key can derive the same result — which is what makes
+    /// the key-confirmation tag a proof of identity rather than just a checksum.
+    pub fn derive(
+        shared: &[u8; KEY_LEN],
+        authenticated: &[u8; KEY_LEN],
+        salt: &[u8; SALT_LEN],
+    ) -> Self {
+        let mut ikm = [0u8; KEY_LEN * 2];
+        ikm[..KEY_LEN].copy_from_slice(shared);
+        ikm[KEY_LEN..].copy_from_slice(authenticated);
+        let hkdf = Hkdf::<Sha256>::new(Some(salt), &ikm);
 
         let mut key = [0u8; KEY_LEN];
         hkdf.expand(b"vd-control key v1", &mut key)
@@ -134,6 +166,29 @@ impl PairingKeys {
         mac.update(transcript);
         mac.verify_slice(tag).is_ok()
     }
+}
+
+/// Renders a key as lower-case hex, for storing it in a file.
+pub fn key_to_hex(key: &[u8; KEY_LEN]) -> String {
+    let mut text = String::with_capacity(KEY_LEN * 2);
+    for byte in key {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// Parses a key previously produced by [`key_to_hex`].
+pub fn key_from_hex(text: &str) -> Option<[u8; KEY_LEN]> {
+    let text = text.trim();
+    if text.len() != KEY_LEN * 2 {
+        return None;
+    }
+    let mut key = [0u8; KEY_LEN];
+    for (index, slot) in key.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(key)
 }
 
 /// The canonical transcript both peers hash for key confirmation.
@@ -175,8 +230,8 @@ mod tests {
     #[test]
     fn both_sides_derive_the_same_key_and_pin() {
         let (client, host, shared, salt) = exchange();
-        let from_client = PairingKeys::derive(&shared, &salt);
-        let from_host = PairingKeys::derive(&host.shared_secret(&client.public()), &salt);
+        let from_client = PairingKeys::derive(&shared, &shared, &salt);
+        let from_host = PairingKeys::derive(&host.shared_secret(&client.public()), &shared, &salt);
 
         assert_eq!(from_client, from_host);
         assert!(from_client.pin < PIN_MODULUS);
@@ -189,15 +244,35 @@ mod tests {
         let mut other_salt = salt;
         other_salt[0] ^= 0xff;
         assert_ne!(
-            PairingKeys::derive(&shared, &salt).key,
-            PairingKeys::derive(&shared, &other_salt).key
+            PairingKeys::derive(&shared, &shared, &salt).key,
+            PairingKeys::derive(&shared, &shared, &other_salt).key
         );
+    }
+
+    #[test]
+    fn the_authenticated_secret_changes_the_key() {
+        let (_, _, shared, salt) = exchange();
+        assert_ne!(
+            PairingKeys::derive(&shared, &shared, &salt).key,
+            PairingKeys::derive(&shared, &[9u8; KEY_LEN], &salt).key
+        );
+    }
+
+    #[test]
+    fn keys_round_trip_through_hex() {
+        let key = [0xab, 0x01, 0xff, 0x10];
+        let mut full = [0u8; KEY_LEN];
+        full[..key.len()].copy_from_slice(&key);
+        assert_eq!(key_from_hex(&key_to_hex(&full)), Some(full));
+
+        assert!(key_from_hex("too short").is_none());
+        assert!(key_from_hex(&"z".repeat(KEY_LEN * 2)).is_none());
     }
 
     #[test]
     fn confirmation_tag_round_trips() {
         let (client, host, shared, salt) = exchange();
-        let keys = PairingKeys::derive(&shared, &salt);
+        let keys = PairingKeys::derive(&shared, &shared, &salt);
         let tr = transcript(1, &client.public(), &host.public(), &salt);
         let tag = keys.confirm_tag(&tr);
 
@@ -207,7 +282,7 @@ mod tests {
     #[test]
     fn confirmation_tag_rejects_tampering() {
         let (client, host, shared, salt) = exchange();
-        let keys = PairingKeys::derive(&shared, &salt);
+        let keys = PairingKeys::derive(&shared, &shared, &salt);
         let tr = transcript(1, &client.public(), &host.public(), &salt);
         let tag = keys.confirm_tag(&tr);
 
@@ -216,7 +291,7 @@ mod tests {
         assert!(!keys.verify_tag(&other, &tag));
 
         // A different key fails.
-        let other_keys = PairingKeys::derive(&[7u8; KEY_LEN], &salt);
+        let other_keys = PairingKeys::derive(&[7u8; KEY_LEN], &shared, &salt);
         assert!(!other_keys.verify_tag(&tr, &tag));
     }
 }

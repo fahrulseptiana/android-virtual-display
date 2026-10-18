@@ -21,8 +21,8 @@
 //! [`ClientHandshake::confirm`].
 
 use crate::error::{Error, Result};
-use crate::protocol::HostInfo;
-use crate::session::pairing::{self, EphemeralKey, PairingKeys};
+use crate::protocol::{HostId, HostInfo};
+use crate::session::pairing::{self, EphemeralKey, PairingKeys, KEY_LEN};
 use crate::session::{
     Capabilities, ClientInfo, RejectReason, SessionMessage, VideoCodec, SESSION_PROTOCOL_VERSION,
 };
@@ -92,6 +92,8 @@ struct Pending {
     host: HostInfo,
     agreed: Capabilities,
     keys: PairingKeys,
+    /// The host's long-lived identity key, for the caller's trust decision.
+    identity_public: [u8; KEY_LEN],
 }
 
 impl ClientHandshake {
@@ -141,6 +143,7 @@ impl ClientHandshake {
                 host,
                 capabilities,
                 host_public,
+                identity_public,
                 salt,
                 tag,
             } => {
@@ -151,8 +154,11 @@ impl ClientHandshake {
                     });
                 }
 
+                // The second secret can only be computed by a host holding the
+                // identity key it just claimed, which is what authenticates it.
                 let shared = self.key.shared_secret(&host_public);
-                let keys = PairingKeys::derive(&shared, &salt);
+                let authenticated = self.key.shared_secret(&identity_public);
+                let keys = PairingKeys::derive(&shared, &authenticated, &salt);
                 let transcript =
                     pairing::transcript(protocol, &self.key.public(), &host_public, &salt);
                 if !keys.verify_tag(&transcript, &tag) {
@@ -166,6 +172,7 @@ impl ClientHandshake {
                     host,
                     agreed: self.capabilities.intersect(&capabilities),
                     keys,
+                    identity_public,
                 });
                 self.state = State::Awaiting;
                 Ok(Action::AwaitingConfirmation { pin })
@@ -179,6 +186,18 @@ impl ClientHandshake {
             | SessionMessage::Ping
             | SessionMessage::Pong => Err(Error::Protocol("host sent a client-only message")),
         }
+    }
+
+    /// The host identity offered in the `Welcome`, for the trust decision.
+    pub fn host_identity(&self) -> Option<&[u8; KEY_LEN]> {
+        self.pending
+            .as_ref()
+            .map(|pending| &pending.identity_public)
+    }
+
+    /// The host's id, once a `Welcome` has been received.
+    pub fn host_id(&self) -> Option<&HostId> {
+        self.pending.as_ref().map(|pending| &pending.host.id)
     }
 
     /// Confirms the pairing after the user approved the PIN.
@@ -210,16 +229,20 @@ impl ClientHandshake {
 pub struct HostHandshake {
     host: HostInfo,
     capabilities: Capabilities,
+    /// Long-lived identity secret; the matching public key is published in
+    /// `Welcome` and is what clients remember.
+    identity_secret: [u8; KEY_LEN],
     state: State,
     session: Option<Session>,
 }
 
 impl HostHandshake {
     /// Prepares a handshake that waits for a client's `Hello`.
-    pub fn new(host: HostInfo, capabilities: Capabilities) -> Self {
+    pub fn new(host: HostInfo, capabilities: Capabilities, identity_secret: [u8; KEY_LEN]) -> Self {
         Self {
             host,
             capabilities,
+            identity_secret,
             state: State::Awaiting,
             session: None,
         }
@@ -262,7 +285,11 @@ impl HostHandshake {
                 let key = EphemeralKey::generate()?;
                 let salt = pairing::generate_salt()?;
                 let shared = key.shared_secret(&client_public);
-                let keys = PairingKeys::derive(&shared, &salt);
+                // DH against our own identity key: the client computes the same
+                // value from our published public key and its ephemeral secret.
+                let authenticated =
+                    pairing::shared_with_secret(&self.identity_secret, &client_public);
+                let keys = PairingKeys::derive(&shared, &authenticated, &salt);
                 let transcript =
                     pairing::transcript(protocol, &client_public, &key.public(), &salt);
                 let tag = keys.confirm_tag(&transcript);
@@ -282,6 +309,7 @@ impl HostHandshake {
                     self.host.clone(),
                     self.capabilities.clone(),
                     key.public(),
+                    pairing::public_from_secret(&self.identity_secret),
                     salt,
                     tag,
                 )))
@@ -301,6 +329,11 @@ mod tests {
     use crate::protocol::{HostId, Platform};
     use crate::session::pairing::KEY_LEN;
     use crate::session::InputCapabilities;
+
+    /// A host handshake with a fixed identity key.
+    fn host_handshake(codecs: &[VideoCodec], fps: u16) -> HostHandshake {
+        HostHandshake::new(host_info(), capabilities(codecs, fps), [7u8; KEY_LEN])
+    }
 
     fn host_info() -> HostInfo {
         HostInfo::new(HostId::from("host-1"), "DESKTOP")
@@ -338,7 +371,7 @@ mod tests {
 
     #[test]
     fn happy_path_agrees_on_a_session_and_key() {
-        let mut host = HostHandshake::new(host_info(), capabilities(&[VideoCodec::H264], 60));
+        let mut host = host_handshake(&[VideoCodec::H264], 60);
         let mut client =
             ClientHandshake::new(client_info(), capabilities(&[VideoCodec::H264], 30)).unwrap();
 
@@ -367,10 +400,7 @@ mod tests {
 
     #[test]
     fn negotiates_the_codec_both_sides_share() {
-        let mut host = HostHandshake::new(
-            host_info(),
-            capabilities(&[VideoCodec::H264, VideoCodec::Av1], 60),
-        );
+        let mut host = host_handshake(&[VideoCodec::H264, VideoCodec::Av1], 60);
         let mut client = ClientHandshake::new(
             client_info(),
             capabilities(&[VideoCodec::Hevc, VideoCodec::H264], 60),
@@ -389,7 +419,7 @@ mod tests {
 
     #[test]
     fn client_rejects_a_bad_host_tag() {
-        let mut host = HostHandshake::new(host_info(), capabilities(&[VideoCodec::H264], 60));
+        let mut host = host_handshake(&[VideoCodec::H264], 60);
         let mut client =
             ClientHandshake::new(client_info(), capabilities(&[VideoCodec::H264], 60)).unwrap();
 
@@ -399,6 +429,7 @@ mod tests {
             host: host_info,
             capabilities,
             host_public,
+            identity_public,
             salt,
             ..
         } = reply
@@ -410,6 +441,7 @@ mod tests {
             host: host_info,
             capabilities,
             host_public,
+            identity_public,
             salt,
             tag: [0u8; KEY_LEN],
         };
@@ -421,7 +453,7 @@ mod tests {
 
     #[test]
     fn rejects_an_incompatible_protocol() {
-        let mut host = HostHandshake::new(host_info(), Capabilities::default());
+        let mut host = HostHandshake::new(host_info(), Capabilities::default(), [7u8; KEY_LEN]);
         let hello = SessionMessage::Hello {
             protocol: SESSION_PROTOCOL_VERSION + 1,
             client: client_info(),
@@ -446,7 +478,7 @@ mod tests {
 
     #[test]
     fn out_of_order_messages_are_rejected() {
-        let mut host = HostHandshake::new(host_info(), Capabilities::default());
+        let mut host = HostHandshake::new(host_info(), Capabilities::default(), [7u8; KEY_LEN]);
         let err = host
             .on_message(SessionMessage::Reject {
                 reason: RejectReason::Busy,
