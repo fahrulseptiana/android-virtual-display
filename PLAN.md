@@ -41,9 +41,9 @@ with input flowing back to the PC, at a latency that feels native.
 │  vd-host                                                                    │
 │   ├── discovery::Responder        UDP 47700  (probe / announce / bye)       │
 │   ├── control server              TCP 47701  (handshake, caps, input)       │
-│   ├── capture (DXGI / WGC)        GPU/CPU frames                            │
-│   ├── encode (Media Foundation)   H.264/HEVC bitstream                      │
-│   └── input injection (SendInput) mouse / keyboard / touch                  │
+│   ├── capture (DXGI)              desktop frame + cursor, downscaled        │
+│   ├── encode (Media Foundation)   hardware H.264 bitstream                  │
+│   └── input injection (SendInput) mouse / keyboard          ← not yet       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     ▲  Wi-Fi, same L2 network
@@ -53,9 +53,9 @@ with input flowing back to the PC, at a latency that feels native.
 │  vd-client                                                                  │
 │   ├── discovery::Browser          UDP 47700                                 │
 │   ├── control client              TCP 47701                                 │
-│   ├── MediaCodec decode           H.264/HEVC → Surface                      │
-│   ├── render (egui + wgpu)        video surface + on-screen UI              │
-│   └── input capture               touch / keyboard → host                   │
+│   ├── MediaCodec decode           H.264 → NV12 → RGBA                       │
+│   ├── render (egui + wgpu)        searching / host list / full-screen video │
+│   └── input capture               touch / keyboard → host    ← not yet      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -72,25 +72,38 @@ Vulkan is already present — the client composites with `wgpu`, whose Android
 backend is Vulkan — but no amount of it helps the actual bottleneck, which is
 the codec.
 
+**Where we are:** hardware encode and hardware decode both work, driven from
+system memory, and the display sustains the host's 30 fps. The zero-copy
+transfers below are the remaining part of this strategy; they are now an
+efficiency question (CPU, power, headroom) rather than a speed one.
+
 ```
-host:  DXGI (D3D11 texture)
-         └─▶ D3D11 Video Processor      scale 4K→target, BGRA→NV12, on the GPU
-               └─▶ Media Foundation MFT hardware H.264 (D3D11-aware, zero-copy)
-                     └─▶ encrypt ─▶ TCP
+host:   DXGI (D3D11 texture)
+          └─▶ D3D11 Video Processor    scale 4K→target, BGRA→NV12   ← not yet
+                └─▶ Media Foundation hardware H.264 MFT
+                      └─▶ encrypt ─▶ TCP
 
-client: TCP ─▶ decrypt ─▶ MediaCodec hardware H.264 ─▶ Surface
-                             └─▶ composited by wgpu (Vulkan) under the egui UI
+client: TCP ─▶ decrypt ─▶ MediaCodec hardware H.264 ─▶ Surface      ← not yet
+                             └─▶ composited by wgpu (Vulkan)
 ```
 
-What this removes, measured on a 3840×2160 desktop streamed at 1280×720:
+What the hardware codecs removed, measured on a 3840×2160 desktop streamed at
+1280×720:
 
-| Removed | Cost today | Replaced by |
-|---------|-----------|-------------|
+| Removed | Was | Now |
+|---------|-----|-----|
+| CPU JPEG encode (host) | 16 ms | hardware H.264 encode, ~3 ms |
+| CPU JPEG decode (tablet) | ~400 ms | MediaCodec, ~2 ms |
+| Software H.264 encode | ~15 fps ceiling | ~30 fps, matching the host target |
+
+Still on the CPU, and worth removing later:
+
+| Still on the CPU | Cost | Would become |
+|------------------|------|--------------|
 | GPU→CPU readback of the 4K frame | 33 MB/frame | stays on the GPU |
-| CPU box downscale | 25 ms | D3D11 video processor (~1 ms) |
-| CPU JPEG encode | 16 ms | hardware H.264 encode (~5 ms) |
-| CPU JPEG decode on the tablet | ~400 ms | MediaCodec (~2 ms) |
-| RGBA texture upload on the client | 3.7 MB/frame | not needed (decode to a Surface) |
+| Box downscale 4K→720p (host) | ~23 ms | D3D11 video processor (~1 ms) |
+| YUV→RGBA conversion (tablet) | ~13 ms | decoded straight to a `Surface` |
+| RGBA texture upload (tablet) | ~9 ms | not needed with a `Surface` |
 
 Why not Vulkan Video (`VK_KHR_video_encode_queue` / `_decode_queue`)? It is a
 real API, but hardware *encode* support on Windows drivers is immature, and on
@@ -163,6 +176,11 @@ active man-in-the-middle who re-runs the exchange on both sides. See
 - [x] Stream size is bounded: a 4K frame is downscaled to the target size with
       a box filter before encoding (the `image` crate's resampler cost 1.7 s per
       4K frame; the box filter costs 25 ms).
+- [x] **Cursor:** Desktop Duplication leaves the pointer *out* of the desktop
+      image — it is a separate overlay — so the duplication also fetches the
+      pointer position and bitmap and blends it into the frame before scaling.
+      Handles all three shapes Windows emits (colour, masked-colour,
+      monochrome AND/XOR).
 - [ ] **Fallback:** Windows.Graphics.Capture — needed for some HDR/protected
       cases and per-window capture.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
@@ -172,16 +190,21 @@ active man-in-the-middle who re-runs the exchange on both sides. See
 ### Phase 4 — Video encode
 
 - [x] Interim codec: JPEG (`vd-core::codec`), enough to prove the pipeline.
-      Measured from a 3840×2160 desktop streamed at 1280×720 in release:
-      **8.9–13 fps** (box downscale 25 ms, JPEG encode 16 ms per frame). On the
-      tablet the pure-Rust JPEG *decoder* is the client-side limit (~2 fps).
-- [ ] **Primary:** hardware H.264 through Media Foundation. The image is scaled
-      and converted to NV12 by the **D3D11 Video Processor**, then fed to a
-      hardware encoder MFT as a D3D11 texture (zero-copy). See the
+      Kept as the capability-negotiated fallback.
+- [x] **Hardware H.264** through a Media Foundation MFT (`AMDh264Encoder`), fed
+      NV12 from system memory. Getting there needed four fixes that all reported
+      the wrong error: the D3D11 device lacked `D3D11_CREATE_DEVICE_VIDEO_SUPPORT`;
+      the async unlock has to go on the transform (via
+      `IMFTransform::GetAttributes`, since casting to `IMFAttributes` fails);
+      `MFT_MESSAGE_SET_D3D_MANAGER` wants the device-manager *pointer*, not the
+      reset token; and async transforms must be driven through their event
+      queue. Falls back to the software encoder automatically.
+- [ ] **Zero-copy input:** scale and convert to NV12 with the **D3D11 Video
+      Processor** and hand the encoder a D3D11 texture, removing the 33 MB
+      readback and the 23 ms CPU downscale. See the
       [GPU acceleration strategy](#gpu-acceleration-strategy-decision-record).
 - [ ] Rate control for Wi-Fi: variable bitrate with a capped bitrate, keyframe
       on demand (first frame, loss recovery, resolution change).
-- [ ] Keep the JPEG/raw path as the capability-negotiated fallback.
 - [ ] Optional, later: HEVC and AV1 (AV1 only where hardware decode exists).
 
 **Decision:** start with H.264 — it has the widest hardware decode support on
@@ -190,39 +213,49 @@ negotiation from Phase 2.
 
 ### Phase 5 — Transport
 
-- [ ] **Start:** TCP with a length-prefixed frame header (id, timestamp,
-      keyframe flag, codec, size). Simple and reliable; good enough to measure.
+- [x] **Start:** TCP with a length-prefixed frame header (kind byte, then either
+      a JSON control message or a binary video frame). Simple and reliable, and
+      it carries the encrypted session.
+- [x] Frame dropping rather than queueing: the host's fan-out gives each client
+      a single slot, and the client's decode queue and frame queue are bounded,
+      so a slow link degrades by dropping frames.
 - [ ] **Then:** evaluate an unreliable, ordered datagram transport (QUIC or
-      custom UDP + FEC) once real latency data exists. Wi-Fi does not need TCP's
+      custom UDP + FEC) with real latency data. Wi-Fi does not need TCP's
       head-of-line blocking for video.
-- [ ] Frame pacing / send scheduling so a slow link degrades gracefully
-      (drop frames, never queue unboundedly).
+- [ ] Measure glass-to-glass latency; nothing reports it yet, so the < 50 ms
+      budget is still unverified.
 
 > Keep the transport behind a trait so Phase 5 can replace TCP without touching
 > capture, encode, decode or UI.
 
 ### Phase 6 — Android decode + render
 
-- [x] JPEG decode on the client and display through an egui texture, off the UI
-      thread, with a one-slot mailbox so the display never lags the stream.
 - [x] H.264 through MediaCodec (`vd-client::media_codec`), the NDK C API via a
-      small FFI layer. Output is requested as NV12 and converted to RGBA on the
-      CPU. Measured on the tablet: **7.8 fps**, against ~2 fps for JPEG.
-- [x] Sustained 720p30 end to end. Two client-side bugs were the whole gap:
-      decoding ran inline on the read thread (so it stopped reading the socket
-      for ~19 ms per frame, the TCP window filled and the host's broadcaster
-      dropped frames), and the decoded-frame mailbox kept only the newest frame
-      (so half of every decoder burst was discarded). Fixing those took the
-      client from ~12 to **29.0 fps**, matching the host.
-- [ ] Zero-copy output is now an efficiency rather than a speed matter: decoding
-      to a `Surface` would remove the 18.5 ms CPU decode-plus-convert and the
-      texture upload, saving power and CPU, but the display already runs at the
-      host's frame rate. It costs the egui overlay, so it is only worth doing if
-      measurements show we are CPU or thermally bound.
+      small FFI layer behind `#[cfg(target_os = "android")]`. Output is
+      requested as NV12 and converted to RGBA on the CPU for the egui texture.
+- [x] Decode runs on its own thread. Inline decoding stopped the reader for
+      ~19 ms per frame, the TCP window filled, the host's write blocked, and its
+      broadcaster dropped frames — which capped the client at ~12 fps.
+- [x] A bounded frame **queue**, not a single slot. A hardware decoder does not
+      emit evenly: it stalls and returns two pictures at once, and a single slot
+      let the second overwrite the first before the UI saw it, discarding half of
+      every pair.
+- [x] Sustained 720p30 end to end (29.0 fps measured), matching the host's
+      target. Those two bugs were the entire gap.
+- [x] Client UI (`vd-client::app`): three states — a "No Host Found" ripple
+      while searching, a tappable host list (name, platform, address, online
+      dot), and the desktop full-screen with Android's back button returning to
+      the list and disconnecting.
+- [ ] Zero-copy output is an efficiency rather than a speed matter now: decoding
+      to a `Surface` would remove the ~13 ms YUV→RGBA conversion and the ~9 ms
+      texture upload, saving CPU and power, but the display already matches the
+      host. It costs the egui overlay, so only worth doing if measurements show
+      we are CPU or thermally bound.
 - [ ] Adaptive: drop late frames rather than queueing; track decode/render
-      timings for the latency budget.
+      timings against the latency budget.
 - [ ] Handle rotation, notch/cutout, and backgrounding (pause capture when the
       app is not visible).
+- [ ] Software keyboard for hosts that need it (Phase 7).
 
 ### Phase 7 — Input forwarding
 
@@ -297,7 +330,7 @@ Instrumentation ships from Phase 3 onward so regressions are visible.
 | **M1 — Discoverable** ✅ | Hosts show up on the device | 0–1 |
 | **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
 | **M3 — First frame** ✅ | Synthetic capture → JPEG → encrypted TCP → decode → screen | 3–6 (minimal) |
-| **M4 — Usable** | Real DXGI capture ✅, H.264 end to end ✅ (7.8 fps), hardware encode ⚠️, 1080p30+ ✗ | 3–6 |
+| **M4 — Usable** ✅ | Real DXGI capture, hardware H.264 both ends, 720p30, cursor mirrored, three-state UI | 3–6 |
 | **M5 — Interactive** | Input forwarding | 7 |
 | **M6 — Native feel** | 1080p60, < 50 ms, audio, reconnect | 5–8 |
 
@@ -318,7 +351,9 @@ Instrumentation ships from Phase 3 onward so regressions are visible.
 
 ## 7. Open questions
 
-1. eframe/egui overlay vs. a dedicated `SurfaceView`/`TextureView` for video?
+1. ~~eframe/egui overlay vs. a dedicated `SurfaceView`/`TextureView` for video?~~
+   Settled for now: egui holds 30 fps, so the overlay stays. A `Surface` remains
+   the option if CPU or power becomes the limit.
 2. QUIC vs. custom UDP+FEC for Phase 5 — decide with real measurements.
 3. Is per-window capture (WGC) worth it, or is per-monitor enough?
 4. Minimum supported Android version — currently 31 (Android 12); MediaCodec

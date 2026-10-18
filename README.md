@@ -13,10 +13,11 @@ Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
 > **Status: 720p30, hardware on both ends.** The client discovers a host, pairs,
-> opens an encrypted session and displays the live Windows desktop: DXGI capture
-> → AMD hardware H.264 encode → MediaCodec hardware decode, sustained at the
-> host's 30 fps target. Remaining work is input forwarding, authenticated
-> pairing, and optional zero-copy on both ends. See PLAN.md.
+> opens an encrypted session and displays the live Windows desktop — DXGI
+> capture (with the mouse cursor) → AMD hardware H.264 encode → MediaCodec
+> hardware decode — sustained at the host's 30 fps target. The UI is a
+> searching ripple, a tappable host list and a full-screen desktop. Remaining
+> work is input forwarding and authenticated pairing. See PLAN.md.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -33,16 +34,32 @@ Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 │   │       ├── protocol.rs        # HostInfo, DiscoveryMessage, Envelope (JSON over UDP)
 │   │       ├── net.rs             # PacketIo trait + UdpPacketIo implementation
 │   │       ├── discovery          # browser.rs (client) + responder.rs (host)
-│   │       └── session            # control channel
-│   │           ├── mod.rs         # SessionMessage + capability types
-│   │           ├── handshake.rs   # Client/HostHandshake state machines
-│   │           ├── pairing.rs     # X25519 exchange, PIN, key confirmation
-│   │           ├── cipher.rs      # ChaCha20-Poly1305 session cipher
-│   │           ├── channel.rs     # plaintext/encrypted message transport
-│   │           ├── frame.rs       # length-prefixed framing
-│   │           └── heartbeat.rs   # liveness tracking
-│   ├── vd-host                    # Windows host: discovery + control server
-│   └── vd-client                  # Android cdylib + desktop harness
+│   │       ├── session            # control channel
+│   │       │   ├── mod.rs         # SessionMessage + capability types
+│   │       │   ├── handshake.rs   # Client/HostHandshake state machines
+│   │       │   ├── pairing.rs     # X25519 exchange, PIN, key confirmation
+│   │       │   ├── cipher.rs      # ChaCha20-Poly1305 session cipher
+│   │       │   ├── channel.rs     # plaintext/encrypted message transport
+│   │       │   ├── frame.rs       # length-prefixed framing
+│   │       │   └── heartbeat.rs   # liveness tracking
+│   │       ├── video              # FrameHeader / VideoFrame wire format
+│   │       ├── capture            # FrameSource trait + synthetic test pattern
+│   │       └── codec.rs           # JPEG, downscaling, RGBA→NV12
+│   ├── vd-host                    # Windows host
+│   │   └── src
+│   │       ├── main.rs            # wiring, settings, diagnostics
+│   │       ├── gpu.rs             # the shared D3D11 device
+│   │       ├── dxgi.rs            # Desktop Duplication + cursor compositing
+│   │       ├── encoder/h264.rs    # Media Foundation hardware H.264
+│   │       ├── video.rs           # capture → encode → broadcast
+│   │       ├── control.rs         # TCP control server (per-connection thread)
+│   │       └── identity.rs        # stable host id
+│   └── vd-client                  # Android client + desktop harness
+│       └── src
+│           ├── app.rs             # UI: searching / host list / full-screen
+│           ├── connection.rs      # session worker, decode thread, reconnects
+│           ├── frames.rs          # bounded decoded-frame queue
+│           └── media_codec.rs     # Android MediaCodec FFI (NDK)
 └── android                        # Gradle project that packages the APK
     └── app/src/main
         ├── AndroidManifest.xml    # NativeActivity -> libvd_client.so
@@ -120,14 +137,18 @@ dimensions, sequence, timestamp) followed by the encoded image.
 
 The host captures through a `FrameSource` — DXGI Desktop Duplication on
 Windows, or a synthetic test pattern as a fallback — encodes and fans the
-result out to every client through a `Broadcaster`. Frames larger than the
-configured size are downscaled with a fast box filter first, so a 4K desktop
-becomes a streamable 1280×720. Each client gets a single-slot channel, so a
-slow client misses frames instead of queueing them. Capture pauses entirely
-when nobody is watching.
+result out to every client through a `Broadcaster`. Desktop Duplication leaves
+the mouse cursor out of the desktop image (it is a separate overlay), so the
+pointer position and bitmap are fetched too and blended into the frame before
+scaling. Frames larger than the configured size are downscaled with a fast box
+filter first, so a 4K desktop becomes a streamable 1280×720. Each client gets a
+single-slot channel, so a slow client misses frames instead of queueing them.
+Capture pauses entirely when nobody is watching.
 
-The client decodes off the UI thread into a one-slot mailbox and uploads the
-newest frame as a texture, so the display never lags behind the stream.
+The client decodes on its own thread and queues the result for the UI, which
+draws one frame per repaint. Both the decoder's queue and the UI's are bounded
+and drop the oldest frame rather than growing, so a slow moment costs frames
+instead of latency.
 
 > H.264 is the default (Media Foundation on the host, MediaCodec on the
 > tablet); `VD_CODEC=jpeg` forces the older JPEG path, which also serves as the
@@ -164,10 +185,16 @@ cargo run -p vd-host --release
 
 Environment variables:
 
-| Variable | Meaning |
-|----------|---------|
-| `RUST_LOG` | log level, e.g. `debug` (default `info`) |
-| `VD_HOST_NAME` | overrides the advertised machine name |
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `RUST_LOG` | log level, e.g. `debug` | `info` |
+| `VD_HOST_NAME` | overrides the advertised machine name | machine name |
+| `VD_OUTPUT` | which monitor to duplicate | `0` |
+| `VD_VIDEO_SIZE` | stream size, `WxH` — the stream is downscaled to fit | `1280x800` |
+| `VD_VIDEO_FPS` | encoder target frame rate | `30` |
+| `VD_CODEC` | `jpeg` forces the fallback codec | H.264 |
+| `VD_ENCODER` | `software` forces the software encoder, or a name substring such as `dx12` | hardware first |
+| `VD_ENCODER_CHECK` | encode 30 synthetic frames, print the result and exit (a diagnostic) | off |
 
 The host id is generated once and stored in
 `%LOCALAPPDATA%\id.fahrul.vd\host-id`, so clients recognise the machine across
@@ -179,9 +206,11 @@ The Android UI is plain `egui`, so the exactly same code runs on the desktop.
 This is the fastest way to iterate:
 
 ```bash
-cargo run -p vd-client            # GUI
+cargo run -p vd-client --release      # GUI
 cargo run -p vd-client --example discover   # headless, prints hosts for 5 s
 ```
+
+`VD_CLIENT_NAME` overrides the name this client advertises.
 
 ### Client — Android
 
@@ -199,6 +228,12 @@ The script compiles the Rust crate with `cargo ndk` (writing
 `libvd_client.so` into `android/app/src/main/jniLibs/<abi>/`) and then runs
 Gradle. You can also open the `android/` folder in Android Studio — just build
 the native library first, since the `.so` files are not checked in.
+
+> **Use `--release` when measuring.** A debug native library is roughly ten
+> times slower in the pixel paths (decoding, YUV conversion, texture upload),
+> which turns 30 fps into about 3. The release APK is signed with the debug key
+> so it can be installed locally; replace that with a real key before
+> distributing.
 
 ---
 
@@ -231,10 +266,12 @@ The project deliberately leans on a few principles:
 - [x] H.264 end to end: Media Foundation encode on the host, MediaCodec decode on
       the tablet ([strategy](PLAN.md#gpu-acceleration-strategy-decision-record))
 - [x] Hardware (GPU) H.264 encode (AMD hardware MFT)
-- [ ] Zero-copy: D3D11 video processor on the host, Surface/AHardwareBuffer on
-      the client
-- [ ] Trust-on-first-use host identity (authenticated pairing)
+- [x] Mouse cursor mirrored from the host
+- [x] Client UI: searching ripple → host list → full-screen, back to return
 - [ ] Touch / keyboard input forwarding
+- [ ] Trust-on-first-use host identity (authenticated pairing)
+- [ ] Zero-copy: D3D11 video processor on the host, Surface on the client
+      (efficiency, not speed — see PLAN.md)
 
 ## Testing
 
