@@ -28,7 +28,7 @@ use vd_core::{
     Platform, RejectReason, Session, SessionMessage, VideoCodec,
 };
 
-use crate::frames::{DecodedFrame, LatestFrame};
+use crate::frames::{DecodedFrame, FrameQueue};
 
 #[cfg(target_os = "android")]
 pub use crate::media_codec::H264Decoder;
@@ -102,7 +102,7 @@ pub fn connect(
     addr: SocketAddr,
     host: HostInfo,
     events: Sender<ConnectionEvent>,
-    frames: LatestFrame,
+    frames: FrameQueue,
 ) -> ConnectionHandle {
     let (decisions_tx, decisions_rx) = channel();
     thread::spawn(move || supervise(addr, host, events, decisions_rx, frames));
@@ -118,7 +118,7 @@ fn supervise(
     host: HostInfo,
     events: Sender<ConnectionEvent>,
     decisions: Receiver<bool>,
-    frames: LatestFrame,
+    frames: FrameQueue,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut previous_error: Option<String> = None;
@@ -194,7 +194,7 @@ fn attempt(
     host_name: &str,
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
-    frames: &LatestFrame,
+    frames: &FrameQueue,
 ) -> Attempt {
     frames.clear();
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -375,7 +375,7 @@ fn confirm_pairing(
 /// socket for ~18 ms per frame, the TCP window would fill, the host's write
 /// would block, and the broadcaster would drop frames — which is exactly what
 /// the first version of this did.
-fn handle_stream(frames: &LatestFrame, worker: &DecoderWorker, frame: Frame) {
+fn handle_stream(frames: &FrameQueue, worker: &DecoderWorker, frame: Frame) {
     match frame {
         Frame::Control(SessionMessage::VideoConfig {
             format,
@@ -390,6 +390,7 @@ fn handle_stream(frames: &LatestFrame, worker: &DecoderWorker, frame: Frame) {
         // Pongs and anything else need no action.
         Frame::Control(_) => {}
         Frame::Video(video) if video.header.format == FrameFormat::H264 => {
+            report_wire_sequence(video.header.sequence);
             worker.submit(
                 video.payload.clone(),
                 video.header.sequence,
@@ -425,7 +426,7 @@ struct DecoderWorker {
 }
 
 impl DecoderWorker {
-    fn spawn(frames: LatestFrame) -> Self {
+    fn spawn(frames: FrameQueue) -> Self {
         let (jobs, receiver) = sync_channel(DECODE_QUEUE);
         let handle = thread::spawn(move || decode_loop(receiver, frames));
         Self {
@@ -471,34 +472,105 @@ impl Drop for DecoderWorker {
     }
 }
 
-/// Counts access units in and pictures out, so the decoder's own throughput is
-/// visible independently of how often the UI happens to redraw.
-fn report_decode_throughput(produced: usize) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static INPUTS: AtomicU64 = AtomicU64::new(0);
-    static OUTPUTS: AtomicU64 = AtomicU64::new(0);
-    static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+/// Watches the sequence numbers arriving on the wire, so duplicates and gaps are
+/// visible independently of anything the decoder or the UI do.
+fn report_wire_sequence(sequence: u64) {
+    use std::sync::Mutex;
 
-    INPUTS.fetch_add(1, Ordering::Relaxed);
-    let outputs = OUTPUTS.fetch_add(produced as u64, Ordering::Relaxed) + produced as u64;
+    /// Last sequence seen, counts of [duplicate, in-order, gap], window start.
+    type WireState = (Option<u64>, [u32; 3], Instant);
+    static STATE: std::sync::OnceLock<Mutex<WireState>> = std::sync::OnceLock::new();
 
-    let last = LAST.get_or_init(|| std::sync::Mutex::new(Instant::now()));
-    let mut last = last.lock().unwrap();
-    if last.elapsed() >= Duration::from_secs(5) {
-        let seconds = last.elapsed().as_secs_f32();
-        let inputs = INPUTS.swap(0, Ordering::Relaxed);
-        OUTPUTS.store(0, Ordering::Relaxed);
+    let mut state = STATE
+        .get_or_init(|| Mutex::new((None, [0; 3], Instant::now())))
+        .lock()
+        .unwrap();
+
+    if let Some(previous) = state.0 {
+        let delta = sequence.wrapping_sub(previous);
+        // 0 = duplicate, 1 = next, anything else = a gap.
+        match delta {
+            0 => state.1[0] += 1,
+            1 => state.1[1] += 1,
+            _ => state.1[2] += 1,
+        }
+    }
+    state.0 = Some(sequence);
+
+    if state.2.elapsed() >= Duration::from_secs(5) {
+        let seconds = state.2.elapsed().as_secs_f32();
+        let total: u32 = state.1.iter().sum();
         info!(
-            "decoder: {:.1} access units/s in, {:.1} pictures/s out",
-            inputs as f32 / seconds,
-            outputs as f32 / seconds
+            "wire: {:.1} frames/s ({:.1}/s duplicated, {:.1}/s in order, {:.1}/s with gaps)",
+            total as f32 / seconds,
+            state.1[0] as f32 / seconds,
+            state.1[1] as f32 / seconds,
+            state.1[2] as f32 / seconds,
         );
-        *last = Instant::now();
+        state.1 = [0; 3];
+        state.2 = Instant::now();
     }
 }
 
-fn decode_loop(jobs: Receiver<DecodeJob>, frames: LatestFrame) {
+/// Counters shared by the decoder thread, so its own throughput is visible
+/// independently of how often the UI happens to redraw.
+mod decode_stats {
+    use std::sync::atomic::AtomicU64;
+
+    pub static INPUTS: AtomicU64 = AtomicU64::new(0);
+    pub static PICTURES: AtomicU64 = AtomicU64::new(0);
+    pub static DISTINCT: AtomicU64 = AtomicU64::new(0);
+    pub static LAST_SEQUENCE: AtomicU64 = AtomicU64::new(u64::MAX);
+    pub static LAST_REPORT: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::OnceLock::new();
+}
+
+/// Records one access unit going in and the pictures coming out.
+fn record_decode(sequence: u64, produced: usize) {
+    use std::sync::atomic::Ordering;
+    decode_stats::INPUTS.fetch_add(1, Ordering::Relaxed);
+    decode_stats::PICTURES.fetch_add(produced as u64, Ordering::Relaxed);
+    if produced > 0 {
+        let previous = decode_stats::LAST_SEQUENCE.swap(sequence, Ordering::Relaxed);
+        if previous != sequence {
+            decode_stats::DISTINCT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Prints the decoder's throughput every few seconds.
+fn report_decode_throughput(now: Instant) {
+    use std::sync::atomic::Ordering;
+
+    let last = decode_stats::LAST_REPORT.get_or_init(|| std::sync::Mutex::new(now));
+    let mut last = last.lock().unwrap();
+    if last.elapsed() < Duration::from_secs(5) {
+        return;
+    }
+
+    let inputs = decode_stats::INPUTS.swap(0, Ordering::Relaxed);
+    let pictures = decode_stats::PICTURES.swap(0, Ordering::Relaxed);
+    let distinct = decode_stats::DISTINCT.swap(0, Ordering::Relaxed);
+    let seconds = last.elapsed().as_secs_f32();
+    *last = now;
+    if seconds <= 0.0 {
+        return;
+    }
+
+    info!(
+        "decoder: {:.1} access units/s in, {:.1} pictures/s out, {:.1} distinct sequences/s",
+        inputs as f32 / seconds,
+        pictures as f32 / seconds,
+        distinct as f32 / seconds,
+    );
+}
+
+fn decode_loop(jobs: Receiver<DecodeJob>, frames: FrameQueue) {
     let mut decoder: Option<Decoder> = None;
+    // One input can yield several pictures (the decoder catching up after a
+    // stall). They must not share a sequence, or the UI's "is it new?" check
+    // collapses them and silently drops all but the last.
+    let mut picture_index: u64 = 0;
 
     while let Ok(job) = jobs.recv() {
         match job {
@@ -529,16 +601,17 @@ fn decode_loop(jobs: Receiver<DecodeJob>, frames: LatestFrame) {
                 };
                 match decode_timed(decoder, &payload, timestamp_us) {
                     Ok(images) => {
-                        let produced = images.len();
+                        record_decode(sequence, images.len());
                         for image in images {
                             frames.publish(DecodedFrame {
-                                sequence,
+                                sequence: picture_index,
                                 width: image.width,
                                 height: image.height,
                                 pixels: image.pixels,
                             });
+                            picture_index += 1;
                         }
-                        report_decode_throughput(produced);
+                        report_decode_throughput(Instant::now());
                     }
                     Err(err) => warn!("H.264 decode failed: {err}"),
                 }
@@ -586,7 +659,7 @@ fn report_undecodable(format: FrameFormat) {
 /// Decodes a received frame into the UI mailbox, dropping it on failure.
 ///
 /// A codec we cannot decode is reported once, not on every frame.
-fn publish_frame(frames: &LatestFrame, video: &VideoFrame) {
+fn publish_frame(frames: &FrameQueue, video: &VideoFrame) {
     match decode_rgba(video) {
         Ok(image) => frames.publish(DecodedFrame {
             sequence: video.header.sequence,

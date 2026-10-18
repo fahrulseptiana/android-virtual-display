@@ -12,7 +12,7 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use vd_client::connection::{self, ConnectionEvent};
-use vd_client::frames::LatestFrame;
+use vd_client::frames::FrameQueue;
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (events_tx, events_rx) = channel();
-    let frames = LatestFrame::new();
+    let frames = FrameQueue::new();
     let handle = connection::connect(
         host.control_addr(),
         host.info.clone(),
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if let Some(frame) = frames.latest() {
+        if let Some(frame) = frames.next() {
             if last_sequence != Some(frame.sequence) {
                 last_sequence = Some(frame.sequence);
                 received += 1;

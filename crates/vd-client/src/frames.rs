@@ -1,15 +1,25 @@
-//! The most recent decoded video frame.
+//! Decoded frames waiting to be drawn.
 //!
-//! The connection worker decodes frames off the UI thread and publishes them
-//! here; the UI always renders the newest one. Older frames are dropped rather
-//! than queued, so the display never lags behind the stream.
+//! The connection worker decodes off the UI thread and publishes here; the UI
+//! pops one frame per repaint.
+//!
+//! This is a small **queue**, not a single slot. A hardware decoder does not
+//! emit pictures evenly: it stalls and then returns two at once, and with a
+//! single slot the second overwrites the first before the UI ever sees it —
+//! which halved the displayed frame rate. The queue is bounded, and the oldest
+//! frame is dropped when it is full, so a UI that falls behind shows the newest
+//! frames rather than drifting into the past.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+/// How many decoded frames may wait for the UI.
+const CAPACITY: usize = 3;
 
 /// A decoded frame, ready to be uploaded as a texture.
 #[derive(Debug)]
 pub struct DecodedFrame {
-    /// Sequence number from the sender; lets the UI skip redundant uploads.
+    /// Monotonic per-session counter; lets the UI notice skipped frames.
     pub sequence: u64,
     pub width: u32,
     pub height: u32,
@@ -17,31 +27,53 @@ pub struct DecodedFrame {
     pub pixels: Vec<u8>,
 }
 
-/// A one-slot mailbox between the worker and the UI.
-#[derive(Clone, Default)]
-pub struct LatestFrame {
-    slot: Arc<Mutex<Option<Arc<DecodedFrame>>>>,
+/// A bounded queue between the decoder and the UI.
+#[derive(Clone)]
+pub struct FrameQueue {
+    pending: Arc<Mutex<VecDeque<Arc<DecodedFrame>>>>,
 }
 
-impl LatestFrame {
-    /// Creates an empty mailbox.
+impl Default for FrameQueue {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(VecDeque::with_capacity(CAPACITY))),
+        }
+    }
+}
+
+impl FrameQueue {
+    /// Creates an empty queue.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Stores `frame`, replacing whatever was there.
+    /// Queues `frame`, dropping the oldest if the UI is behind.
     pub fn publish(&self, frame: DecodedFrame) {
-        *self.slot.lock().unwrap() = Some(Arc::new(frame));
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= CAPACITY {
+            pending.pop_front();
+        }
+        pending.push_back(Arc::new(frame));
     }
 
-    /// The newest frame, if any.
-    pub fn latest(&self) -> Option<Arc<DecodedFrame>> {
-        self.slot.lock().unwrap().clone()
+    /// Takes the oldest waiting frame, if any.
+    pub fn next(&self) -> Option<Arc<DecodedFrame>> {
+        self.pending.lock().unwrap().pop_front()
     }
 
-    /// Drops the current frame (used when a session ends).
+    /// How many frames are waiting.
+    pub fn len(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Whether no frame is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drops everything (used when a session ends).
     pub fn clear(&self) {
-        *self.slot.lock().unwrap() = None;
+        self.pending.lock().unwrap().clear();
     }
 }
 
@@ -59,15 +91,42 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_the_newest_frame() {
-        let mailbox = LatestFrame::new();
-        assert!(mailbox.latest().is_none());
+    fn delivers_frames_in_order() {
+        let queue = FrameQueue::new();
+        assert!(queue.next().is_none());
 
-        mailbox.publish(frame(1));
-        mailbox.publish(frame(2));
-        assert_eq!(mailbox.latest().unwrap().sequence, 2);
+        queue.publish(frame(1));
+        queue.publish(frame(2));
+        assert_eq!(queue.next().unwrap().sequence, 1);
+        assert_eq!(queue.next().unwrap().sequence, 2);
+        assert!(queue.next().is_none());
+    }
 
-        mailbox.clear();
-        assert!(mailbox.latest().is_none());
+    #[test]
+    fn a_burst_is_not_collapsed() {
+        // The decoder often returns two pictures at once; both must survive.
+        let queue = FrameQueue::new();
+        queue.publish(frame(1));
+        queue.publish(frame(2));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn drops_the_oldest_when_the_ui_falls_behind() {
+        let queue = FrameQueue::new();
+        for sequence in 0..CAPACITY as u64 + 2 {
+            queue.publish(frame(sequence));
+        }
+        // The newest CAPACITY frames are kept.
+        assert_eq!(queue.len(), CAPACITY);
+        assert_eq!(queue.next().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn clear_empties_the_queue() {
+        let queue = FrameQueue::new();
+        queue.publish(frame(1));
+        queue.clear();
+        assert!(queue.is_empty());
     }
 }

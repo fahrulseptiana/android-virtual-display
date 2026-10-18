@@ -10,7 +10,7 @@ use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEven
 use vd_core::{HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
-use crate::frames::LatestFrame;
+use crate::frames::FrameQueue;
 
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -60,15 +60,15 @@ pub struct VdClientApp {
     /// The live connection, used to answer pairing requests.
     handle: Option<ConnectionHandle>,
     /// Newest decoded frame, written by the connection worker.
-    frames: LatestFrame,
+    frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
     uploaded_sequence: Option<u64>,
     frames_seen: u64,
     first_frame_at: Option<Instant>,
     /// Diagnostic counters: UI passes, and distinct frames the worker produced.
     repaints: u64,
-    arrivals: u64,
-    last_arrival_sequence: Option<u64>,
+    /// Frames per second over the last reporting window.
+    measured_fps: f32,
     last_report: Instant,
 }
 
@@ -84,14 +84,13 @@ impl VdClientApp {
             events_rx,
             connection: Connection::Idle,
             handle: None,
-            frames: LatestFrame::new(),
+            frames: FrameQueue::new(),
             texture: None,
             uploaded_sequence: None,
             frames_seen: 0,
             first_frame_at: None,
             repaints: 0,
-            arrivals: 0,
-            last_arrival_sequence: None,
+            measured_fps: 0.0,
             last_report: Instant::now(),
         };
 
@@ -168,14 +167,13 @@ impl VdClientApp {
         }
     }
 
-    /// Uploads the newest frame as a texture, if it is newer than the last one.
+    /// Uploads one queued frame as a texture.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
-        let Some(frame) = self.frames.latest() else {
+        // One frame per repaint: there is far more repaint headroom (~55/s) than
+        // frames (~30/s), so the queue stays empty and nothing is collapsed.
+        let Some(frame) = self.frames.next() else {
             return;
         };
-        if self.uploaded_sequence == Some(frame.sequence) {
-            return;
-        }
         let started = std::time::Instant::now();
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -201,29 +199,20 @@ impl VdClientApp {
     }
 
     /// Counts frames the decoder has produced (not how often we draw them).
-    fn note_frame_arrival(&mut self) {
-        if let Some(frame) = self.frames.latest() {
-            if self.last_arrival_sequence != Some(frame.sequence) {
-                self.last_arrival_sequence = Some(frame.sequence);
-                self.arrivals += 1;
-            }
-        }
-    }
-
     /// Reports the two rates that matter while diagnosing the render path.
     fn maybe_report(&mut self, _ctx: &egui::Context) {
         if self.last_report.elapsed() < Duration::from_secs(5) {
             return;
         }
         let seconds = self.last_report.elapsed().as_secs_f32();
+        self.measured_fps = self.frames_seen as f32 / seconds;
         log::info!(
-            "rates: {:.1} repaints/s, {:.1} frames/s, {:.1} uploads/s",
+            "rates: {:.1} repaints/s, {:.1} frames/s drawn, {} queued",
             self.repaints as f32 / seconds,
-            self.arrivals as f32 / seconds,
-            self.frames_seen as f32 / seconds
+            self.measured_fps,
+            self.frames.len(),
         );
         self.repaints = 0;
-        self.arrivals = 0;
         self.frames_seen = 0;
         self.last_report = Instant::now();
     }
@@ -251,19 +240,13 @@ impl VdClientApp {
         ));
     }
 
-    /// Frames per second since the session was established.
+    /// Frames per second, measured over the reporting window.
+    ///
+    /// Dividing the running count by the time since the session started would
+    /// drift towards zero as the session goes on, because the count is reset
+    /// every window but the divisor is not.
     fn fps(&self) -> f32 {
-        match self.first_frame_at {
-            Some(start) => {
-                let seconds = start.elapsed().as_secs_f32();
-                if seconds > 0.0 {
-                    self.frames_seen as f32 / seconds
-                } else {
-                    0.0
-                }
-            }
-            None => 0.0,
-        }
+        self.measured_fps
     }
 }
 
@@ -276,7 +259,6 @@ impl Default for VdClientApp {
 impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.repaints += 1;
-        self.note_frame_arrival();
         self.maybe_report(ui.ctx());
         self.poll_discovery();
         self.poll_connection();
