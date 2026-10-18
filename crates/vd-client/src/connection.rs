@@ -31,6 +31,7 @@ use vd_core::{
 };
 
 use crate::frames::{DecodedFrame, FrameQueue};
+use crate::trust::TrustStore;
 
 #[cfg(target_os = "android")]
 pub use crate::media_codec::H264Decoder;
@@ -77,7 +78,13 @@ pub enum ConnectionEvent {
     /// An attempt is starting; `note` carries the previous failure, if any.
     Connecting { host: String, note: Option<String> },
     /// The host proposed a pairing: the user must approve the PIN.
-    PairingRequired { host: String, pin: u32 },
+    PairingRequired {
+        host: String,
+        pin: u32,
+        /// True when this host was already known but presented a different
+        /// identity key — worth showing the user in the strongest terms.
+        identity_changed: bool,
+    },
     /// Handshake and pairing succeeded.
     Established(Box<Session>),
     /// An attempt failed; the worker will retry after a backoff.
@@ -112,11 +119,22 @@ pub fn connect(
     host: HostInfo,
     events: Sender<ConnectionEvent>,
     frames: FrameQueue,
+    trust_path: Option<std::path::PathBuf>,
 ) -> ConnectionHandle {
     let (decisions_tx, decisions_rx) = channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_flag = cancelled.clone();
-    thread::spawn(move || supervise(addr, host, events, decisions_rx, frames, cancel_flag));
+    thread::spawn(move || {
+        supervise(
+            addr,
+            host,
+            events,
+            decisions_rx,
+            frames,
+            cancel_flag,
+            trust_path,
+        )
+    });
     ConnectionHandle {
         decisions: decisions_tx,
         cancelled,
@@ -132,7 +150,11 @@ fn supervise(
     decisions: Receiver<bool>,
     frames: FrameQueue,
     cancelled: Arc<AtomicBool>,
+    trust_path: Option<std::path::PathBuf>,
 ) {
+    // Loaded once for the lifetime of the worker: this store is what makes a
+    // reconnect to a known host silent.
+    let mut trust = TrustStore::load(trust_path);
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut previous_error: Option<String> = None;
 
@@ -151,7 +173,9 @@ fn supervise(
             return; // the UI is gone
         }
 
-        match attempt(addr, &host.name, &events, &decisions, &frames, &cancelled) {
+        match attempt(
+            addr, &host.name, &events, &decisions, &frames, &cancelled, &mut trust,
+        ) {
             Attempt::Disconnected(error) => {
                 // We had a session, so retry promptly.
                 warn!("session with {} ended: {error}", host.name);
@@ -219,6 +243,7 @@ fn attempt(
     decisions: &Receiver<bool>,
     frames: &FrameQueue,
     cancelled: &Arc<AtomicBool>,
+    trust: &mut TrustStore,
 ) -> Attempt {
     frames.clear();
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -276,6 +301,7 @@ fn attempt(
                     let Frame::Control(message) = frame else {
                         return Attempt::Disconnected("video before the handshake".to_owned());
                     };
+                    let message = *message;
 
                     let action = match handshake.on_message(message) {
                         Ok(action) => action,
@@ -283,12 +309,21 @@ fn attempt(
                     };
 
                     if let Action::AwaitingConfirmation { pin } = action {
+                        let identity = handshake.host_identity().copied();
+                        let Some(host_id) = handshake.host_id().cloned() else {
+                            return Attempt::Disconnected(
+                                "the host welcomed us without an identity".to_owned(),
+                            );
+                        };
                         let Some(session) = confirm_pairing(
                             host_name,
+                            &host_id,
                             pin,
+                            identity,
                             events,
                             decisions,
                             &mut handshake,
+                            trust,
                             cancelled,
                         ) else {
                             return Attempt::Cancelled;
@@ -355,58 +390,83 @@ fn attempt(
 /// Asks the UI to approve the PIN, then completes the handshake.
 ///
 /// Returns `None` if the user declined.
+#[allow(clippy::too_many_arguments)]
 fn confirm_pairing(
     host_name: &str,
+    host_id: &vd_core::HostId,
     pin: u32,
+    identity: Option<[u8; 32]>,
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
     handshake: &mut ClientHandshake,
+    trust: &mut TrustStore,
     cancelled: &Arc<AtomicBool>,
 ) -> Option<Session> {
-    info!("pairing with \"{host_name}\" — PIN {pin:06}");
-    if events
-        .send(ConnectionEvent::PairingRequired {
-            host: host_name.to_owned(),
-            pin,
-        })
-        .is_err()
-    {
-        return None;
-    }
+    let trusted = identity
+        .as_ref()
+        .map(|key| trust.matches(host_id, key))
+        .unwrap_or(false);
 
-    let decision = loop {
-        if cancelled.load(Ordering::Relaxed) {
+    if trusted {
+        // A host we have paired with before, presenting the same identity.
+        // No prompt — this is what makes reconnecting seamless.
+        info!("{host_name} is a known host; pairing without a prompt");
+    } else {
+        let identity_changed = trust.has(host_id);
+        if identity_changed {
+            warn!(
+                "{host_name} presented a different identity key than the one we remember; \
+                 this is either a re-installed host or something impersonating it"
+            );
+        }
+        info!("pairing with \"{host_name}\" — PIN {pin:06}");
+        if events
+            .send(ConnectionEvent::PairingRequired {
+                host: host_name.to_owned(),
+                pin,
+                identity_changed,
+            })
+            .is_err()
+        {
             return None;
         }
-        match decisions.recv_timeout(Duration::from_millis(200)) {
-            Ok(approved) => break approved,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
-        }
-    };
 
-    match decision {
-        true => {
-            info!("pairing with \"{host_name}\" approved");
-            match handshake.confirm() {
-                Ok(Action::Established(session)) => {
-                    info!(
-                        "session established with \"{}\" — protocol v{}, codec {}",
-                        session.host.name,
-                        session.protocol,
-                        codec_name(session.codec),
-                    );
-                    Some(session)
-                }
-                Ok(_) => None,
-                Err(err) => {
-                    warn!("could not confirm pairing: {err}");
-                    None
-                }
+        let decision = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
             }
-        }
-        false => {
+            match decisions.recv_timeout(Duration::from_millis(200)) {
+                Ok(approved) => break approved,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        };
+
+        if !decision {
             info!("pairing with \"{host_name}\" rejected by the user");
+            return None;
+        }
+
+        // Trust on first use: remember the identity the user just accepted.
+        if let Some(key) = identity {
+            info!("remembering {host_name}'s identity");
+            trust.remember(host_id.clone(), key);
+        }
+    }
+
+    match handshake.confirm() {
+        Ok(Action::Established(session)) => {
+            info!(
+                "session established with \"{}\" — protocol v{}, codec {}",
+                session.host.name,
+                session.protocol,
+                codec_name(session.codec),
+            );
+            Some(session)
+        }
+        Ok(_) => None,
+        Err(err) => {
+            warn!("could not confirm pairing: {err}");
             None
         }
     }
@@ -420,12 +480,16 @@ fn confirm_pairing(
 /// the first version of this did.
 fn handle_stream(frames: &FrameQueue, worker: &DecoderWorker, frame: Frame) {
     match frame {
-        Frame::Control(SessionMessage::VideoConfig {
-            format,
-            width,
-            height,
-            extradata,
-        }) => {
+        Frame::Control(message) if matches!(*message, SessionMessage::VideoConfig { .. }) => {
+            let SessionMessage::VideoConfig {
+                format,
+                width,
+                height,
+                extradata,
+            } = *message
+            else {
+                unreachable!("guarded above")
+            };
             if format == FrameFormat::H264 {
                 worker.configure(width, height, extradata);
             }

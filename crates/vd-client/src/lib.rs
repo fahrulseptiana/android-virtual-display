@@ -13,6 +13,7 @@ pub mod frames;
 pub mod logging;
 #[cfg(target_os = "android")]
 pub mod media_codec;
+pub mod trust;
 
 pub const APP_NAME: &str = "VD Client";
 
@@ -22,10 +23,11 @@ pub const APP_NAME: &str = "VD Client";
 #[cfg(not(target_os = "android"))]
 pub fn run_desktop() -> eframe::Result<()> {
     logging::init();
+    let trust_path = trust::default_path();
     eframe::run_native(
         APP_NAME,
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(app::VdClientApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(app::VdClientApp::new(trust_path)))),
     )
 }
 
@@ -43,6 +45,12 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
     static INIT_LOGGING: OnceLock<()> = OnceLock::new();
     INIT_LOGGING.get_or_init(logging::init);
 
+    // The activity's private directory: where known host identities live, so a
+    // reconnect needs no prompt.
+    let trust_path = android_app
+        .internal_data_path()
+        .map(|dir| dir.join("known-hosts"));
+
     let options = eframe::NativeOptions {
         android_app: Some(android_app),
         ..Default::default()
@@ -51,7 +59,7 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
     if let Err(err) = eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|_cc| Ok(Box::new(app::VdClientApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(app::VdClientApp::new(trust_path)))),
     ) {
         log::error!("eframe exited with an error: {err}");
     }

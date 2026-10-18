@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use vd_client::connection::{self, ConnectionEvent};
 use vd_client::frames::FrameQueue;
+use vd_client::trust;
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host.info.clone(),
         events_tx,
         frames.clone(),
+        trust::default_path(),
     );
 
     let deadline = Instant::now() + hold;
@@ -66,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while Instant::now() < deadline {
         match events_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(ConnectionEvent::PairingRequired { host, pin }) => {
+            Ok(ConnectionEvent::PairingRequired { host, pin, .. }) => {
                 println!("  pairing with {host} — PIN {pin:06} (auto-approving)");
                 handle.decide_pairing(true);
             }
