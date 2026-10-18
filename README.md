@@ -12,11 +12,11 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: H.264 end to end, hardware on both ends.** The client discovers a
-> host, pairs, opens an encrypted session and displays the live Windows desktop:
-> DXGI capture → AMD hardware H.264 encode → MediaCodec hardware decode. Measured
-> at ~12 fps at 720p; the remaining cost is the CPU readback and scale on the
-> host and the YUV→RGBA conversion on the tablet. See PLAN.md.
+> **Status: 720p30, hardware on both ends.** The client discovers a host, pairs,
+> opens an encrypted session and displays the live Windows desktop: DXGI capture
+> → AMD hardware H.264 encode → MediaCodec hardware decode, sustained at the
+> host's 30 fps target. Remaining work is input forwarding, authenticated
+> pairing, and optional zero-copy on both ends. See PLAN.md.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
