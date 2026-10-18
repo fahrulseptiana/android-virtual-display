@@ -21,6 +21,10 @@ mod encoder;
 #[cfg(windows)]
 mod gpu;
 mod identity;
+#[cfg(windows)]
+mod single_instance;
+#[cfg(windows)]
+mod tray;
 mod video;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,8 +39,28 @@ use vd_core::{Capabilities, HostInfo};
 /// How often the responder is serviced.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Name of the mutex that keeps one host per machine.
+#[cfg(windows)]
+const INSTANCE_MUTEX: &str = "id.fahrul.vd.host";
+
 fn main() -> vd_core::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // A second host would fight the first over the discovery and control ports,
+    // and would announce the same machine twice.
+    #[cfg(windows)]
+    let _instance = match single_instance::SingleInstance::acquire(INSTANCE_MUTEX) {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => {
+            error!("VD Host is already running; only one instance is allowed");
+            return Ok(());
+        }
+        // Not being able to create the mutex is not a reason to refuse to run.
+        Err(err) => {
+            warn!("could not check for another instance: {err}");
+            None
+        }
+    };
 
     let config = DiscoveryConfig::default();
     let host = HostInfo::new(identity::load_or_create_host_id(), identity::host_name());
@@ -72,22 +96,55 @@ fn main() -> vd_core::Result<()> {
     // Tell the network we are here right away.
     responder.announce(Instant::now())?;
 
+    let control_addr = control.local_addr().map(|addr| addr.port()).unwrap_or(0);
+
+    // The services run on their own thread so the main thread can own the tray
+    // icon's message loop.
+    let services_running = running.clone();
+    let services = std::thread::spawn(move || {
+        let mut responder = responder;
+        let control = control;
+        while services_running.load(Ordering::Relaxed) {
+            if let Err(err) = responder.poll(Instant::now()) {
+                // A single bad datagram must not take the host down.
+                warn!("discovery poll failed: {err}");
+            }
+            if let Err(err) = control.poll() {
+                warn!("control accept failed: {err}");
+            }
+            std::thread::sleep(TICK);
+        }
+        if let Err(err) = responder.bye() {
+            error!("failed to say goodbye: {err}");
+        }
+        debug!("bye sent; shutting down");
+    });
+
+    run_until_stopped(&running, control_addr);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = services.join();
+    Ok(())
+}
+
+/// Shows the tray icon and waits until the host is asked to stop.
+#[cfg(windows)]
+fn run_until_stopped(running: &Arc<AtomicBool>, control_port: u16) {
+    let tooltip = format!("VD Host — running, control port {control_port}");
+    if let Err(err) = tray::run(running.clone(), &tooltip) {
+        warn!("could not show the tray icon ({err}); falling back to Ctrl+C");
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(TICK);
+        }
+    }
+}
+
+/// Waits until the host is asked to stop.
+#[cfg(not(windows))]
+fn run_until_stopped(running: &Arc<AtomicBool>, _control_port: u16) {
     while running.load(Ordering::Relaxed) {
-        if let Err(err) = responder.poll(Instant::now()) {
-            // A single bad datagram must not take the host down.
-            warn!("discovery poll failed: {err}");
-        }
-        if let Err(err) = control.poll() {
-            warn!("control accept failed: {err}");
-        }
         std::thread::sleep(TICK);
     }
-
-    if let Err(err) = responder.bye() {
-        error!("failed to say goodbye: {err}");
-    }
-    debug!("bye sent; shutting down");
-    Ok(())
 }
 
 /// What this host can do.

@@ -201,6 +201,11 @@ The host id is generated once and stored in
 `%LOCALAPPDATA%\id.fahrul.vd\host-id`, so clients recognise the machine across
 restarts.
 
+While it runs the host shows a notification-area icon — a visible "still here"
+marker — with **Exit** on its right-click menu. Only one instance can run at a
+time: a second copy exits immediately rather than fighting the first for the
+discovery and control ports and announcing the machine twice.
+
 ### Client — desktop harness
 
 The Android UI is plain `egui`, so the exactly same code runs on the desktop.
