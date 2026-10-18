@@ -11,7 +11,7 @@
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use vd_client::connection;
+use vd_client::connection::{self, ConnectionEvent};
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,11 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (events_tx, events_rx) = channel();
-    connection::connect(host.control_addr(), host.info.clone(), events_tx);
+    let handle = connection::connect(host.control_addr(), host.info.clone(), events_tx);
 
     let deadline = Instant::now() + hold;
     while Instant::now() < deadline {
         match events_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ConnectionEvent::PairingRequired { host, pin }) => {
+                println!("  pairing with {host} — PIN {pin:06} (auto-approving)");
+                handle.decide_pairing(true);
+            }
             Ok(event) => println!("  {event:?}"),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,

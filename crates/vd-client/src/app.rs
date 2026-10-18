@@ -9,7 +9,7 @@ use eframe::egui;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
 use vd_core::{HostInfo, RejectReason, Session};
 
-use crate::connection::{self, ConnectionEvent};
+use crate::connection::{self, ConnectionEvent, ConnectionHandle};
 
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -20,15 +20,31 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 /// State of the control connection.
 enum Connection {
     Idle,
-    Connecting { host: String, note: Option<String> },
-    Connected { session: Box<Session> },
-    Failed { host: String, reason: String },
+    Connecting {
+        host: String,
+        note: Option<String>,
+    },
+    /// Waiting for the user to approve the pairing PIN.
+    Pairing {
+        host: String,
+        pin: u32,
+    },
+    Connected {
+        session: Box<Session>,
+    },
+    Failed {
+        host: String,
+        reason: String,
+    },
 }
 
 impl Connection {
     /// Whether a connection is in progress or already open.
     fn is_busy(&self) -> bool {
-        matches!(self, Self::Connecting { .. } | Self::Connected { .. })
+        matches!(
+            self,
+            Self::Connecting { .. } | Self::Pairing { .. } | Self::Connected { .. }
+        )
     }
 }
 
@@ -40,6 +56,8 @@ pub struct VdClientApp {
     events_tx: Sender<ConnectionEvent>,
     events_rx: Receiver<ConnectionEvent>,
     connection: Connection,
+    /// The live connection, used to answer pairing requests.
+    handle: Option<ConnectionHandle>,
 }
 
 impl VdClientApp {
@@ -53,6 +71,7 @@ impl VdClientApp {
             events_tx,
             events_rx,
             connection: Connection::Idle,
+            handle: None,
         };
 
         match Browser::bind(DiscoveryConfig::default()) {
@@ -108,6 +127,7 @@ impl VdClientApp {
         while let Ok(event) = self.events_rx.try_recv() {
             self.connection = match event {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
+                ConnectionEvent::PairingRequired { host, pin } => Connection::Pairing { host, pin },
                 ConnectionEvent::Established(session) => Connection::Connected { session },
                 ConnectionEvent::Rejected { host, reason } => Connection::Failed {
                     host,
@@ -135,7 +155,7 @@ impl VdClientApp {
             host: host.name.clone(),
             note: None,
         };
-        connection::connect(addr, host, self.events_tx.clone());
+        self.handle = Some(connection::connect(addr, host, self.events_tx.clone()));
     }
 }
 
@@ -163,6 +183,7 @@ impl eframe::App for VdClientApp {
         let connect_enabled = !connection.is_busy();
         let mut scan_requested = false;
         let mut connect_to: Option<(SocketAddr, HostInfo)> = None;
+        let mut pairing_decision: Option<bool> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(8.0);
@@ -204,6 +225,48 @@ impl eframe::App for VdClientApp {
             });
         });
 
+        if let Connection::Pairing { host, pin } = connection {
+            egui::Window::new("Pair device")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!("Pair with \"{host}\"?"));
+                    ui.add_space(6.0);
+                    ui.heading(format!("{pin:06}"));
+                    ui.label("Confirm this code to start the session.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            pairing_decision = Some(false);
+                        }
+                        if ui.button("Pair").clicked() {
+                            pairing_decision = Some(true);
+                        }
+                    });
+                });
+        }
+
+        if let Some(approved) = pairing_decision {
+            if let Some(handle) = self.handle.as_ref() {
+                handle.decide_pairing(approved);
+            }
+            let host = match &self.connection {
+                Connection::Pairing { host, .. } => Some(host.clone()),
+                _ => None,
+            };
+            match (approved, host) {
+                (true, Some(host)) => {
+                    self.connection = Connection::Connecting { host, note: None };
+                }
+                (false, _) => {
+                    self.connection = Connection::Idle;
+                    self.handle = None;
+                }
+                (true, None) => {}
+            }
+        }
+
         if scan_requested {
             self.scan_now();
         }
@@ -226,6 +289,13 @@ fn connection_status(ui: &mut egui::Ui, connection: &Connection) {
             if let Some(note) = note {
                 ui.label(format!("last attempt: {note}"));
             }
+        }
+        Connection::Pairing { host, pin } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Waiting to pair with {host}…"));
+            });
+            ui.label(format!("PIN: {pin:06}"));
         }
         Connection::Connected { session } => {
             ui.colored_label(

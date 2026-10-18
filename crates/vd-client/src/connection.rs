@@ -1,13 +1,17 @@
 //! Client-side control connection.
 //!
-//! Owns the whole lifecycle of a session: TCP connect, handshake, heartbeats,
-//! and reconnection with exponential backoff. Everything runs on a dedicated
-//! thread and reports progress to the UI over a channel, so the egui repaint
-//! loop never blocks on network I/O.
+//! Owns the whole lifecycle of a session: TCP connect, handshake, pairing
+//! confirmation, heartbeats, and reconnection with exponential backoff.
+//! Everything runs on a dedicated thread and reports progress to the UI over a
+//! channel, so the egui repaint loop never blocks on network I/O.
+//!
+//! Pairing needs a decision from the user, which flows the other way: the
+//! worker emits [`ConnectionEvent::PairingRequired`] and then blocks until the
+//! UI calls [`ConnectionHandle::decide_pairing`].
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,7 +38,9 @@ const READ_BUFFER: usize = 4096;
 pub enum ConnectionEvent {
     /// An attempt is starting; `note` carries the previous failure, if any.
     Connecting { host: String, note: Option<String> },
-    /// Handshake succeeded.
+    /// The host proposed a pairing: the user must approve the PIN.
+    PairingRequired { host: String, pin: u32 },
+    /// Handshake and pairing succeeded.
     Established(Box<Session>),
     /// An attempt failed; the worker will retry after a backoff.
     Failed { host: String, error: String },
@@ -42,13 +48,40 @@ pub enum ConnectionEvent {
     Rejected { host: String, reason: RejectReason },
 }
 
-/// Spawns a thread that keeps a session to `host` alive, reconnecting as needed.
-pub fn connect(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) {
-    thread::spawn(move || supervise(addr, host, events));
+/// The UI's end of a connection: used to answer pairing requests.
+#[derive(Clone, Debug)]
+pub struct ConnectionHandle {
+    decisions: Sender<bool>,
 }
 
-/// Connects, and keeps reconnecting until the host rejects us or the UI is gone.
-fn supervise(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) {
+impl ConnectionHandle {
+    /// Approves or rejects the pending pairing request.
+    pub fn decide_pairing(&self, approved: bool) {
+        let _ = self.decisions.send(approved);
+    }
+}
+
+/// Spawns a thread that keeps a session to `host` alive, reconnecting as needed.
+pub fn connect(
+    addr: SocketAddr,
+    host: HostInfo,
+    events: Sender<ConnectionEvent>,
+) -> ConnectionHandle {
+    let (decisions_tx, decisions_rx) = channel();
+    thread::spawn(move || supervise(addr, host, events, decisions_rx));
+    ConnectionHandle {
+        decisions: decisions_tx,
+    }
+}
+
+/// Connects, and keeps reconnecting until the host rejects us, the user cancels
+/// pairing, or the UI is gone.
+fn supervise(
+    addr: SocketAddr,
+    host: HostInfo,
+    events: Sender<ConnectionEvent>,
+    decisions: Receiver<bool>,
+) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut previous_error: Option<String> = None;
 
@@ -64,7 +97,7 @@ fn supervise(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) 
             return; // the UI is gone
         }
 
-        match attempt(addr, &host.name, &events) {
+        match attempt(addr, &host.name, &events, &decisions) {
             Attempt::Disconnected(error) => {
                 // We had a session, so retry promptly.
                 warn!("session with {} ended: {error}", host.name);
@@ -84,6 +117,10 @@ fn supervise(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) 
                     host: host.name.clone(),
                     reason,
                 });
+                return;
+            }
+            Attempt::Cancelled => {
+                info!("connection to {} cancelled", host.name);
                 return;
             }
         }
@@ -110,9 +147,16 @@ enum Attempt {
     Failed(String),
     /// The host refused the session.
     Rejected(RejectReason),
+    /// The user declined pairing (or the UI went away).
+    Cancelled,
 }
 
-fn attempt(addr: SocketAddr, host_name: &str, events: &Sender<ConnectionEvent>) -> Attempt {
+fn attempt(
+    addr: SocketAddr,
+    host_name: &str,
+    events: &Sender<ConnectionEvent>,
+    decisions: &Receiver<bool>,
+) -> Attempt {
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(err) => return Attempt::Failed(format!("could not connect: {err}")),
@@ -150,45 +194,50 @@ fn attempt(addr: SocketAddr, host_name: &str, events: &Sender<ConnectionEvent>) 
                     if let Some(beat) = heartbeat.as_mut() {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
-                    } else {
-                        let action = match handshake.on_message(message) {
-                            Ok(action) => action,
-                            Err(err) => return Attempt::Disconnected(err.to_string()),
-                        };
+                        continue;
+                    }
 
-                        let established = match action {
-                            Action::AwaitingConfirmation { pin } => {
-                                info!("pairing with \"{host_name}\" — PIN {pin:06}");
-                                // TODO(pairing-ui): ask the user instead of
-                                // confirming automatically.
-                                match handshake.confirm() {
-                                    Ok(Action::Established(session)) => Some(session),
-                                    Ok(_) => None,
-                                    Err(err) => return Attempt::Disconnected(err.to_string()),
-                                }
-                            }
-                            Action::Established(session) => Some(session),
-                            Action::Rejected(reason) => return Attempt::Rejected(reason),
-                            // A client never has to reply during the handshake.
-                            Action::Reply(_) => None,
-                        };
+                    let action = match handshake.on_message(message) {
+                        Ok(action) => action,
+                        Err(err) => return Attempt::Disconnected(err.to_string()),
+                    };
 
-                        if let Some(session) = established {
-                            info!(
-                                "session established with \"{}\" — protocol v{}, codec {}",
-                                session.host.name,
-                                session.protocol,
-                                codec_name(session.codec),
-                            );
+                    if let Action::AwaitingConfirmation { pin } = action {
+                        let Some(session) =
+                            confirm_pairing(host_name, pin, events, decisions, &mut handshake)
+                        else {
+                            return Attempt::Cancelled;
+                        };
+                        // Confirmation blocks on the user, so the heartbeat
+                        // must start *now*, not when the Welcome arrived.
+                        heartbeat = Some(Heartbeat::new(
+                            HEARTBEAT_INTERVAL,
+                            HEARTBEAT_TIMEOUT,
+                            Instant::now(),
+                        ));
+                        if events
+                            .send(ConnectionEvent::Established(Box::new(session)))
+                            .is_err()
+                        {
+                            return Attempt::Cancelled;
+                        }
+                        continue;
+                    }
+
+                    match action {
+                        Action::Established(session) => {
                             heartbeat =
                                 Some(Heartbeat::new(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, now));
                             if events
                                 .send(ConnectionEvent::Established(Box::new(session)))
                                 .is_err()
                             {
-                                return Attempt::Disconnected("ui closed".to_owned());
+                                return Attempt::Cancelled;
                             }
                         }
+                        Action::Rejected(reason) => return Attempt::Rejected(reason),
+                        Action::Reply(_) => {}
+                        Action::AwaitingConfirmation { .. } => unreachable!("handled above"),
                     }
                 }
             }
@@ -218,6 +267,55 @@ fn attempt(addr: SocketAddr, host_name: &str, events: &Sender<ConnectionEvent>) 
             }
             None => {}
         }
+    }
+}
+
+/// Asks the UI to approve the PIN, then completes the handshake.
+///
+/// Returns `None` if the user declined.
+fn confirm_pairing(
+    host_name: &str,
+    pin: u32,
+    events: &Sender<ConnectionEvent>,
+    decisions: &Receiver<bool>,
+    handshake: &mut ClientHandshake,
+) -> Option<Session> {
+    info!("pairing with \"{host_name}\" — PIN {pin:06}");
+    if events
+        .send(ConnectionEvent::PairingRequired {
+            host: host_name.to_owned(),
+            pin,
+        })
+        .is_err()
+    {
+        return None;
+    }
+
+    match decisions.recv() {
+        Ok(true) => {
+            info!("pairing with \"{host_name}\" approved");
+            match handshake.confirm() {
+                Ok(Action::Established(session)) => {
+                    info!(
+                        "session established with \"{}\" — protocol v{}, codec {}",
+                        session.host.name,
+                        session.protocol,
+                        codec_name(session.codec),
+                    );
+                    Some(session)
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    warn!("could not confirm pairing: {err}");
+                    None
+                }
+            }
+        }
+        Ok(false) => {
+            info!("pairing with \"{host_name}\" rejected by the user");
+            None
+        }
+        Err(_) => None, // the UI is gone
     }
 }
 
