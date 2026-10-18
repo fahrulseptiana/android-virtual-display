@@ -15,12 +15,14 @@
 
 mod control;
 mod identity;
+mod video;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
+use vd_core::capture::TestPattern;
 use vd_core::discovery::{DiscoveryConfig, Responder};
 use vd_core::{Capabilities, HostInfo};
 
@@ -33,7 +35,20 @@ fn main() -> vd_core::Result<()> {
     let config = DiscoveryConfig::default();
     let host = HostInfo::new(identity::load_or_create_host_id(), identity::host_name());
     let mut responder = Responder::bind(config.clone(), host.clone())?;
-    let control = control::ControlServer::bind(host.clone(), host_capabilities())?;
+
+    // One capture thread feeds every client.
+    let broadcaster = video::Broadcaster::new();
+    video::spawn_capture(
+        broadcaster.clone(),
+        Box::new(TestPattern::new(
+            video::DEFAULT_WIDTH,
+            video::DEFAULT_HEIGHT,
+        )),
+        video::DEFAULT_FPS,
+    );
+
+    let control =
+        control::ControlServer::bind(host.clone(), host_capabilities(), broadcaster.clone())?;
 
     info!(
         "host \"{}\" ({}) ready — id {}, discovery udp/{}",

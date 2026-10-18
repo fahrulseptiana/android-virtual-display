@@ -6,32 +6,49 @@
 //! client must not stall the discovery loop.
 //!
 //! The `Welcome` is sent in the clear (the client needs it to derive the key);
-//! everything after it is sealed with the session cipher.
+//! everything after it is sealed with the session cipher. Once a session is
+//! established the same connection also carries video frames from the
+//! [`Broadcaster`].
 
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use log::{debug, info, warn};
 use vd_core::session::channel::{Channel, Frame};
 use vd_core::session::cipher::{Role, SessionCipher};
 use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, HostHandshake};
+use vd_core::video::VideoFrame;
 use vd_core::{Capabilities, HostInfo, Session, SessionMessage};
+
+use crate::video::Broadcaster;
 
 /// Read buffer for a single `recv`.
 const READ_BUFFER: usize = 4096;
 
-/// Listens for and handshakes control connections.
+/// How long a serving connection blocks in `read` before it gets a chance to
+/// flush pending video frames.
+const VIDEO_POLL: Duration = Duration::from_millis(10);
+
+/// Listens for, handshakes and streams to control connections.
 pub struct ControlServer {
     listener: TcpListener,
     host: HostInfo,
     capabilities: Capabilities,
+    video: Arc<Broadcaster>,
 }
 
 impl ControlServer {
     /// Binds the control port advertised in discovery.
-    pub fn bind(host: HostInfo, capabilities: Capabilities) -> std::io::Result<Self> {
+    pub fn bind(
+        host: HostInfo,
+        capabilities: Capabilities,
+        video: Arc<Broadcaster>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", host.control_port))?;
         // Non-blocking so the host's discovery loop is never held up.
         listener.set_nonblocking(true)?;
@@ -39,6 +56,7 @@ impl ControlServer {
             listener,
             host,
             capabilities,
+            video,
         })
     }
 
@@ -54,8 +72,9 @@ impl ControlServer {
                 Ok((stream, peer)) => {
                     let host = self.host.clone();
                     let capabilities = self.capabilities.clone();
+                    let video = self.video.clone();
                     thread::spawn(move || {
-                        if let Err(err) = serve(stream, peer, host, capabilities) {
+                        if let Err(err) = serve(stream, peer, host, capabilities, video) {
                             warn!("control connection from {peer} ended with error: {err}");
                         }
                     });
@@ -67,12 +86,14 @@ impl ControlServer {
     }
 }
 
-/// Runs the handshake for one connection, then keeps it open until the client leaves.
+/// Runs the handshake for one connection, then serves control and video until
+/// the client leaves.
 fn serve(
     mut stream: TcpStream,
     peer: SocketAddr,
     host: HostInfo,
     capabilities: Capabilities,
+    video: Arc<Broadcaster>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so the worker explicitly asks for blocking reads.
@@ -85,14 +106,34 @@ fn serve(
     let mut channel = Channel::plaintext();
     let mut buffer = [0u8; READ_BUFFER];
     let mut established = false;
+    let mut video_rx: Option<Receiver<Arc<VideoFrame>>> = None;
 
     loop {
+        // Flush any video the capture thread produced since the last lap.
+        if let Some(receiver) = video_rx.as_ref() {
+            while let Ok(frame) = receiver.try_recv() {
+                match channel.encode_video(&frame) {
+                    Ok(bytes) => {
+                        if let Err(err) = stream.write_all(&bytes) {
+                            if is_disconnect(&err) {
+                                return Ok(());
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                    Err(err) => warn!("could not encode a video frame for {peer}: {err}"),
+                }
+            }
+        }
+
         let read = match stream.read(&mut buffer) {
             Ok(0) => {
                 debug!("control connection from {peer} closed");
                 return Ok(());
             }
             Ok(read) => read,
+            // No control traffic this lap; loop round to send video.
+            Err(err) if is_read_timeout(&err) => continue,
             Err(err) if is_disconnect(&err) => {
                 debug!("control connection from {peer} went away: {err}");
                 return Ok(());
@@ -153,6 +194,9 @@ fn serve(
                 Some(session) => {
                     channel.encrypt(SessionCipher::new(&session.keys.key, Role::Host));
                     established = true;
+                    video_rx = Some(video.subscribe());
+                    // Wake up regularly to send video.
+                    stream.set_read_timeout(Some(VIDEO_POLL))?;
                     log_session(session, peer);
                 }
                 None => {
@@ -173,6 +217,11 @@ fn is_disconnect(err: &IoError) -> bool {
             | ErrorKind::BrokenPipe
             | ErrorKind::UnexpectedEof
     )
+}
+
+/// A read that simply had nothing to report this lap.
+fn is_read_timeout(err: &IoError) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn log_session(session: &Session, peer: SocketAddr) {
