@@ -16,8 +16,8 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncH264VProfile_Main, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEvent,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
     METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT,
     MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
@@ -26,6 +26,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
 };
 
+use super::controls::CodecControls;
 use super::media_foundation::{activate_h264_encoder, EncoderInfo, EncoderPreference};
 
 /// How long to keep serving an asynchronous encoder for one frame.
@@ -64,6 +65,8 @@ pub struct H264Encoder {
     frame_index: u64,
     /// Asynchronous transforms are driven by their event queue.
     events: Option<IMFMediaEventGenerator>,
+    /// Optional vendor controls (rate control, forced keyframes).
+    controls: Option<CodecControls>,
 }
 
 impl H264Encoder {
@@ -168,8 +171,15 @@ impl H264Encoder {
             .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
             .map_err(|err| EncodeError::Configure(format!("StartOfStream: {err}")))?;
 
+        // Vendor controls are optional; encoding works without them.
+        let controls = CodecControls::configure(&transform, bitrate);
+        let can_force_keyframe = controls
+            .as_ref()
+            .map(|controls| controls.can_force_keyframe())
+            .unwrap_or(false);
+
         debug!(
-            "H.264 encoder ready: {} ({}), {}x{} @ {fps} fps, {} kbps, extradata {} bytes",
+            "H.264 encoder ready: {} ({}), {}x{} @ {fps} fps, {} kbps, extradata {} bytes, forced keyframe {can_force_keyframe}",
             info.name,
             if info.hardware {
                 "hardware"
@@ -198,6 +208,7 @@ impl H264Encoder {
             transform,
             _manager: manager,
             events,
+            controls,
             info,
             width,
             height,
@@ -228,6 +239,15 @@ impl H264Encoder {
     /// The SPS/PPS blob (`MF_MT_MPEG_SEQUENCE_HEADER`).
     pub fn sequence_header(&self) -> &[u8] {
         &self.sequence_header
+    }
+
+    /// Asks for an IDR on the next encoded frame.
+    pub fn force_keyframe(&mut self) -> Result<(), EncodeError> {
+        let controls = self
+            .controls
+            .as_ref()
+            .ok_or_else(|| EncodeError::Configure("encoder has no controls".to_owned()))?;
+        controls.force_keyframe().map_err(EncodeError::Configure)
     }
 
     /// Encodes one NV12 frame.
@@ -404,10 +424,18 @@ impl H264Encoder {
 
         match result {
             Ok(()) => match sample {
-                Some(sample) => match sample_bytes(&sample)? {
-                    Some(bytes) if !bytes.is_empty() => Ok(Output::Unit(bytes)),
-                    _ => Ok(Output::Empty),
-                },
+                Some(sample) => {
+                    // A clean point is a keyframe: worth knowing when a client
+                    // has just joined and cannot use predicted frames yet.
+                    if unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0
+                    {
+                        debug!("encoded a keyframe");
+                    }
+                    match sample_bytes(&sample)? {
+                        Some(bytes) if !bytes.is_empty() => Ok(Output::Unit(bytes)),
+                        _ => Ok(Output::Empty),
+                    }
+                }
                 None => Ok(Output::Empty),
             },
             Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(Output::Pending),
@@ -592,6 +620,12 @@ fn sample_bytes(sample: &IMFSample) -> Result<Option<Vec<u8>>, EncodeError> {
 impl crate::video::VideoEncoder for H264Encoder {
     fn encode(&mut self, nv12: &[u8], timestamp_us: u64) -> Result<Vec<Vec<u8>>, String> {
         H264Encoder::encode(self, nv12, timestamp_us).map_err(|err| err.to_string())
+    }
+
+    fn request_keyframe(&mut self) {
+        if let Err(err) = H264Encoder::force_keyframe(self) {
+            debug!("could not force a keyframe: {err}");
+        }
     }
 
     fn sequence_header(&self) -> &[u8] {

@@ -154,7 +154,7 @@ fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
             width,
             height,
             fps,
-            8_000_000,
+            video_bitrate(),
             &preference,
         )
         .map_err(|err| err.to_string())?;
@@ -228,6 +228,16 @@ fn encoder_check(gpu: &gpu::GpuDevice, width: u32, height: u32) {
         "encoder check: {units} access units, {bytes} bytes for {frames} frames, extradata {} bytes",
         encoder.sequence_header().len()
     );
+}
+
+/// Encoder target bitrate, overridable with `VD_VIDEO_BITRATE` (bits per second).
+#[cfg(windows)]
+fn video_bitrate() -> u32 {
+    std::env::var("VD_VIDEO_BITRATE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|bitrate| *bitrate >= 100_000)
+        .unwrap_or(8_000_000)
 }
 
 /// Stream geometry, overridable with `VD_VIDEO_SIZE=WxH` and `VD_VIDEO_FPS`.

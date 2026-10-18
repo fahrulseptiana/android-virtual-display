@@ -4,7 +4,7 @@
 //! single-slot channel, so a client that cannot keep up simply misses frames
 //! instead of forcing unbounded buffering or slowing everyone down.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,6 +35,10 @@ pub trait VideoEncoder {
 
     /// Human readable description, for logs.
     fn describe(&self) -> String;
+
+    /// Asks for a keyframe on the next frame. Defaults to doing nothing, for
+    /// encoders that cannot be asked.
+    fn request_keyframe(&mut self) {}
 }
 
 /// Builds an encoder once the stream size is known.
@@ -60,6 +64,8 @@ pub struct Broadcaster {
     subscribers: Mutex<Vec<SyncSender<Arc<VideoFrame>>>>,
     config: Mutex<Option<StreamConfig>>,
     generations: AtomicU64,
+    /// Set when a client joins, so the capture loop can ask for an IDR.
+    keyframe_wanted: AtomicBool,
 }
 
 impl Default for Broadcaster {
@@ -68,6 +74,7 @@ impl Default for Broadcaster {
             subscribers: Mutex::new(Vec::new()),
             config: Mutex::new(None),
             generations: AtomicU64::new(0),
+            keyframe_wanted: AtomicBool::new(false),
         }
     }
 }
@@ -83,6 +90,9 @@ impl Broadcaster {
         let (sender, receiver) = sync_channel(1);
         let mut subscribers = self.subscribers.lock().unwrap();
         subscribers.push(sender);
+        // A decoder that has just joined cannot use predicted frames, so make
+        // sure the next thing it receives is a keyframe.
+        self.keyframe_wanted.store(true, Ordering::Relaxed);
         debug!("video subscriber added ({} total)", subscribers.len());
         receiver
     }
@@ -104,6 +114,11 @@ impl Broadcaster {
             Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
         });
+    }
+
+    /// Takes (and clears) a pending keyframe request.
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe_wanted.swap(false, Ordering::Relaxed)
     }
 
     /// Records the current stream configuration.
@@ -164,6 +179,12 @@ pub fn spawn_capture(
             }
 
             if watching {
+                if broadcaster.take_keyframe_request() {
+                    if let Some(encoder) = state.encoder.as_mut() {
+                        debug!("a viewer joined; asking for a keyframe");
+                        encoder.request_keyframe();
+                    }
+                }
                 match source.next_frame() {
                     Ok(Some(captured)) => {
                         if let Err(err) = state.handle(&broadcaster, captured, fps) {
