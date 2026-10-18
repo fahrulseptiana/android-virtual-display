@@ -454,3 +454,17 @@ fn sample_bytes(sample: &IMFSample) -> Result<Option<Vec<u8>>, EncodeError> {
     }
     Ok(Some(bytes))
 }
+
+impl crate::video::VideoEncoder for H264Encoder {
+    fn encode(&mut self, nv12: &[u8], timestamp_us: u64) -> Result<Vec<Vec<u8>>, String> {
+        H264Encoder::encode(self, nv12, timestamp_us).map_err(|err| err.to_string())
+    }
+
+    fn sequence_header(&self) -> &[u8] {
+        H264Encoder::sequence_header(self)
+    }
+
+    fn describe(&self) -> String {
+        H264Encoder::describe(self)
+    }
+}

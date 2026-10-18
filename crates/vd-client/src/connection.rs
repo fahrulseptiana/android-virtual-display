@@ -12,6 +12,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -341,6 +342,8 @@ fn confirm_pairing(
 }
 
 /// Decodes a received frame into the UI mailbox, dropping it on failure.
+///
+/// A codec we cannot decode is reported once, not on every frame.
 fn publish_frame(frames: &LatestFrame, video: &VideoFrame) {
     match decode_rgba(video) {
         Ok(image) => frames.publish(DecodedFrame {
@@ -349,9 +352,18 @@ fn publish_frame(frames: &LatestFrame, video: &VideoFrame) {
             height: image.height,
             pixels: image.pixels,
         }),
-        Err(err) => warn!("could not decode a video frame: {err}"),
+        Err(err) => {
+            let mut reported = UNDECODABLE.lock().unwrap();
+            if !reported.contains(&video.header.format) {
+                reported.push(video.header.format);
+                warn!("cannot decode {:?} frames yet: {err}", video.header.format);
+            }
+        }
     }
 }
+
+/// Codecs we have already complained about.
+static UNDECODABLE: Mutex<Vec<vd_core::FrameFormat>> = Mutex::new(Vec::new());
 
 /// A socket read timeout is reported as `TimedOut` on Windows and `WouldBlock`
 /// on Unix; both simply mean "check the heartbeat and read again".

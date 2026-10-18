@@ -50,16 +50,41 @@ pub enum CodecError {
 /// The size `width`×`height` shrinks to so that it fits inside `max_width`×`max_height`,
 /// preserving the aspect ratio. Returns the input size when it already fits.
 pub fn fit_within(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    fit_within_aligned(width, height, max_width, max_height, 1)
+}
+
+/// Like [`fit_within`], but rounds the result down to a multiple of `align`.
+///
+/// Video codecs want even dimensions (chroma is subsampled 2×2), so the encode
+/// path asks for `align = 2`.
+pub fn fit_within_aligned(
+    width: u32,
+    height: u32,
+    max_width: u32,
+    max_height: u32,
+    align: u32,
+) -> (u32, u32) {
+    let align = align.max(1);
     if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
         return (width, height);
     }
-    if width <= max_width && height <= max_height {
-        return (width, height);
-    }
 
-    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
-    let scaled_width = ((width as f64 * scale).round() as u32).max(1);
-    let scaled_height = ((height as f64 * scale).round() as u32).max(1);
+    let (mut scaled_width, mut scaled_height) = if width <= max_width && height <= max_height {
+        (width, height)
+    } else {
+        let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
+        (
+            ((width as f64 * scale).round() as u32).max(1),
+            ((height as f64 * scale).round() as u32).max(1),
+        )
+    };
+
+    if align > 1 {
+        scaled_width -= scaled_width % align;
+        scaled_height -= scaled_height % align;
+        scaled_width = scaled_width.max(align);
+        scaled_height = scaled_height.max(align);
+    }
     (scaled_width, scaled_height)
 }
 
@@ -163,6 +188,37 @@ fn span(index: u32, source: u32, destination: u32) -> (u32, u32) {
     let start = index * source / destination;
     let end = (index + 1) * source / destination + 1;
     (start as u32, end.min(source) as u32)
+}
+
+/// Like [`fit_frame`], but rounds the result to a multiple of `align`.
+pub fn fit_frame_aligned(
+    frame: CapturedFrame,
+    max_width: u32,
+    max_height: u32,
+    align: u32,
+) -> Result<CapturedFrame, CodecError> {
+    let (width, height) =
+        fit_within_aligned(frame.width, frame.height, max_width, max_height, align);
+    if (width, height) == (frame.width, frame.height) {
+        return Ok(frame);
+    }
+
+    let data = box_downscale(
+        &frame.data,
+        frame.format,
+        frame.width,
+        frame.height,
+        width,
+        height,
+    )?;
+
+    Ok(CapturedFrame {
+        width,
+        height,
+        format: FrameFormat::RawRgba,
+        timestamp_us: frame.timestamp_us,
+        data,
+    })
 }
 
 /// Encodes a captured image as JPEG.
@@ -417,6 +473,14 @@ mod tests {
         assert_eq!(fit_within(800, 600, 1280, 800), (800, 600));
         // Zero means "no limit".
         assert_eq!(fit_within(3840, 2160, 0, 0), (3840, 2160));
+    }
+
+    #[test]
+    fn aligned_fit_rounds_to_even() {
+        // 3840x2160 into 1280x800 is 1280x720 (already even).
+        assert_eq!(fit_within_aligned(3840, 2160, 1280, 800, 2), (1280, 720));
+        // An odd result is rounded down.
+        assert_eq!(fit_within_aligned(1001, 999, 1001, 999, 2), (1000, 998));
     }
 
     #[test]

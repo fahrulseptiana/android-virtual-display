@@ -42,18 +42,16 @@ fn main() -> vd_core::Result<()> {
     let host = HostInfo::new(identity::load_or_create_host_id(), identity::host_name());
     let mut responder = Responder::bind(config.clone(), host.clone())?;
 
-    // One capture thread feeds every client.
+    // One capture thread feeds every client. H.264 is used when asked for and an
+    // encoder can be built; otherwise the pipeline falls back to JPEG.
     let (width, height, fps) = video_settings();
     let broadcaster = video::Broadcaster::new();
-    video::spawn_capture(
-        broadcaster.clone(),
-        capture_source(width, height),
-        fps,
-        (width, height),
-    );
+    let source = capture_source(width, height);
+    let encoder = hardware_encoder_factory();
+    let capabilities = host_capabilities(encoder.is_some());
+    video::spawn_capture(broadcaster.clone(), source, fps, (width, height), encoder);
 
-    let control =
-        control::ControlServer::bind(host.clone(), host_capabilities(), broadcaster.clone())?;
+    let control = control::ControlServer::bind(host.clone(), capabilities, broadcaster.clone())?;
 
     info!(
         "host \"{}\" ({}) ready — id {}, discovery udp/{}",
@@ -92,10 +90,21 @@ fn main() -> vd_core::Result<()> {
     Ok(())
 }
 
-/// What this host can do. Video capture/encode is not implemented yet, so no
-/// codec is advertised; input forwarding is planned.
-fn host_capabilities() -> Capabilities {
-    Capabilities::default()
+/// What this host can do.
+///
+/// H.264 is only advertised when an encoder is actually available, so the
+/// negotiated codec matches what will really be sent. Input forwarding is
+/// planned.
+fn host_capabilities(advertise_h264: bool) -> Capabilities {
+    let codecs = if advertise_h264 {
+        vec![vd_core::VideoCodec::H264]
+    } else {
+        Vec::new()
+    };
+    Capabilities {
+        codecs,
+        ..Capabilities::default()
+    }
 }
 
 /// Picks the best available capture source: DXGI on Windows, else a test pattern.
@@ -125,6 +134,36 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
         }
     }
     Box::new(TestPattern::new(width, height))
+}
+
+/// Builds the H.264 encoder factory when `VD_CODEC=h264`.
+///
+/// Returns `None` for JPEG (the default until the client can decode H.264).
+#[cfg(windows)]
+fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
+    if std::env::var("VD_CODEC").as_deref() != Ok("h264") {
+        return None;
+    }
+
+    Some(Box::new(|width, height, fps| {
+        let gpu = gpu::create_device().map_err(|err| err.to_string())?;
+        let prefer_hardware = std::env::var("VD_ENCODER").as_deref() != Ok("software");
+        let encoder = encoder::h264::H264Encoder::new(
+            &gpu.device,
+            width,
+            height,
+            fps,
+            8_000_000,
+            prefer_hardware,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(Box::new(encoder) as Box<dyn video::VideoEncoder>)
+    }))
+}
+
+#[cfg(not(windows))]
+fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
+    None
 }
 
 /// Diagnostic: encode a few synthetic frames and report, so the hardware encoder

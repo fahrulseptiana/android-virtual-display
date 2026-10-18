@@ -107,8 +107,36 @@ fn serve(
     let mut buffer = [0u8; READ_BUFFER];
     let mut established = false;
     let mut video_rx: Option<Receiver<Arc<VideoFrame>>> = None;
+    let mut sent_config: Option<u64> = None;
 
     loop {
+        // Tell the client how the stream is encoded before sending any of it,
+        // and again whenever the encoder is reconfigured.
+        if established {
+            if let Some(config) = video.config() {
+                if sent_config != Some(config.generation) {
+                    let message = SessionMessage::VideoConfig {
+                        format: config.format,
+                        width: config.width,
+                        height: config.height,
+                        extradata: config.extradata.clone(),
+                    };
+                    let frame = channel.encode(&message)?;
+                    if let Err(err) = stream.write_all(&frame) {
+                        if is_disconnect(&err) {
+                            return Ok(());
+                        }
+                        return Err(err.into());
+                    }
+                    debug!(
+                        "sent video config to {peer}: {:?} {}x{}",
+                        config.format, config.width, config.height
+                    );
+                    sent_config = Some(config.generation);
+                }
+            }
+        }
+
         // Flush any video the capture thread produced since the last lap.
         if let Some(receiver) = video_rx.as_ref() {
             while let Ok(frame) = receiver.try_recv() {

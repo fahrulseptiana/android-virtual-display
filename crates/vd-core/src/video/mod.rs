@@ -24,7 +24,8 @@ pub const HEADER_LEN: usize = 26;
 pub const MAX_DIMENSION: u32 = 8192;
 
 /// How the payload bytes are encoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FrameFormat {
     /// JPEG image. Interim codec used until H.264 lands.
     Jpeg,

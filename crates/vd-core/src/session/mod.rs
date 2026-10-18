@@ -153,6 +153,16 @@ pub enum SessionMessage {
     },
     /// Host → client: refuses the session.
     Reject { reason: RejectReason },
+    /// Host → client: the video stream's codec and initialisation data
+    /// (SPS/PPS for H.264). Sent before the first video frame, and again if the
+    /// stream is reconfigured.
+    VideoConfig {
+        format: crate::video::FrameFormat,
+        width: u32,
+        height: u32,
+        /// Codec-specific initialisation data.
+        extradata: Vec<u8>,
+    },
     /// Either side: liveness probe once the session is established.
     Ping,
     /// Reply to a [`SessionMessage::Ping`].
@@ -196,7 +206,7 @@ impl SessionMessage {
     pub fn protocol(&self) -> Option<u16> {
         match self {
             Self::Hello { protocol, .. } | Self::Welcome { protocol, .. } => Some(*protocol),
-            Self::Reject { .. } | Self::Ping | Self::Pong => None,
+            Self::Reject { .. } | Self::VideoConfig { .. } | Self::Ping | Self::Pong => None,
         }
     }
 }
