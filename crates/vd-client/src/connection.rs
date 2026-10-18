@@ -16,7 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
-use vd_core::session::frame::{self, FrameDecoder};
+use vd_core::session::channel::Channel;
+use vd_core::session::cipher::{Role, SessionCipher};
+use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, ClientHandshake};
 use vd_core::{
     Capabilities, ClientInfo, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities, Platform,
@@ -169,7 +171,9 @@ fn attempt(
         Ok(handshake) => handshake,
         Err(err) => return Attempt::Failed(format!("could not generate pairing key: {err}")),
     };
-    if let Err(err) = write_message(&mut stream, &handshake.hello()) {
+    // Plaintext until the Welcome has been processed and pairing confirmed.
+    let mut channel = Channel::plaintext();
+    if let Err(err) = write_message(&mut stream, &mut channel, &handshake.hello()) {
         return Attempt::Failed(format!("could not send hello: {err}"));
     }
 
@@ -185,9 +189,13 @@ fn attempt(
             Ok(read) => {
                 decoder.push(&buffer[..read]);
                 loop {
-                    let message = match decoder.next_message() {
-                        Ok(Some(message)) => message,
+                    let payload = match decoder.next_payload() {
+                        Ok(Some(payload)) => payload,
                         Ok(None) => break,
+                        Err(err) => return Attempt::Disconnected(err.to_string()),
+                    };
+                    let message = match channel.decode(&payload) {
+                        Ok(message) => message,
                         Err(err) => return Attempt::Disconnected(err.to_string()),
                     };
 
@@ -208,8 +216,10 @@ fn attempt(
                         else {
                             return Attempt::Cancelled;
                         };
-                        // Confirmation blocks on the user, so the heartbeat
-                        // must start *now*, not when the Welcome arrived.
+                        // Everything after the Welcome is sealed.
+                        channel.encrypt(SessionCipher::new(&session.keys.key, Role::Client));
+                        // Confirmation blocks on the user, so the heartbeat must
+                        // start now, not when the Welcome arrived.
                         heartbeat = Some(Heartbeat::new(
                             HEARTBEAT_INTERVAL,
                             HEARTBEAT_TIMEOUT,
@@ -225,19 +235,12 @@ fn attempt(
                     }
 
                     match action {
-                        Action::Established(session) => {
-                            heartbeat =
-                                Some(Heartbeat::new(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, now));
-                            if events
-                                .send(ConnectionEvent::Established(Box::new(session)))
-                                .is_err()
-                            {
-                                return Attempt::Cancelled;
-                            }
-                        }
                         Action::Rejected(reason) => return Attempt::Rejected(reason),
+                        // A client never has to reply during the handshake.
                         Action::Reply(_) => {}
-                        Action::AwaitingConfirmation { .. } => unreachable!("handled above"),
+                        Action::Established(_) | Action::AwaitingConfirmation { .. } => {
+                            unreachable!("handled above")
+                        }
                     }
                 }
             }
@@ -249,7 +252,9 @@ fn attempt(
         match heartbeat.as_mut() {
             Some(beat) => match beat.poll(now) {
                 HeartbeatAction::SendPing => {
-                    if let Err(err) = write_message(&mut stream, &SessionMessage::Ping) {
+                    if let Err(err) =
+                        write_message(&mut stream, &mut channel, &SessionMessage::Ping)
+                    {
                         return Attempt::Disconnected(format!("could not send ping: {err}"));
                     }
                 }
@@ -325,8 +330,12 @@ fn is_read_timeout(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn write_message(stream: &mut TcpStream, message: &SessionMessage) -> Result<(), String> {
-    let frame = frame::encode(message).map_err(|err| err.to_string())?;
+fn write_message(
+    stream: &mut TcpStream,
+    channel: &mut Channel,
+    message: &SessionMessage,
+) -> Result<(), String> {
+    let frame = channel.encode(message).map_err(|err| err.to_string())?;
     stream.write_all(&frame).map_err(|err| err.to_string())?;
     stream.flush().map_err(|err| err.to_string())
 }

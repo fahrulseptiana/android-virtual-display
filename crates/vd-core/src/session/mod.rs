@@ -18,6 +18,8 @@
 //! message set here is intentionally small and forward-compatible (unknown
 //! fields carry defaults).
 
+pub mod channel;
+pub mod cipher;
 pub mod frame;
 pub mod handshake;
 pub mod heartbeat;

@@ -26,6 +26,10 @@ pub enum Error {
     /// The operating system's random source was unavailable.
     #[error("could not obtain system entropy")]
     Entropy,
+
+    /// Encryption or decryption of a session message failed.
+    #[error("crypto error: {0}")]
+    Crypto(&'static str),
 }
 
 /// Convenience alias used throughout the crate.

@@ -1,13 +1,14 @@
 //! Length-prefixed framing for the control channel.
 //!
-//! A frame is a 4-byte big-endian length followed by a JSON
-//! [`SessionMessage`]. The framing layer is pure (it works on byte slices), so
-//! it can be driven by any stream implementation — a blocking socket, a
-//! tokio task, or a mock in tests.
+//! A frame is a 4-byte big-endian length followed by an opaque payload. During
+//! the handshake the payload is JSON; once the session is encrypted it is an
+//! AEAD ciphertext (see [`crate::session::cipher`]). The framing layer is pure
+//! (it works on byte slices), so it can be driven by any stream implementation —
+//! a blocking socket, a tokio task, or a mock in tests.
 //!
 //! ```text
 //!   ┌────────────┬──────────────────────────────┐
-//!   │ len (u32)  │ json(SessionMessage)         │
+//!   │ len (u32)  │ payload (json or ciphertext) │
 //!   └────────────┴──────────────────────────────┘
 //! ```
 
@@ -20,10 +21,8 @@ use crate::session::SessionMessage;
 /// a garbled or hostile length prefix instead of allocating wildly.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024;
 
-/// Encodes a message into a complete frame.
-pub fn encode(message: &SessionMessage) -> Result<Vec<u8>> {
-    let payload =
-        serde_json::to_vec(message).map_err(|_| Error::Malformed("session json encode"))?;
+/// Wraps an already-encoded payload in a length prefix.
+pub fn encode_payload(payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() as u64 > MAX_FRAME_LEN as u64 {
         return Err(Error::FrameTooLarge {
             len: payload.len() as u32,
@@ -33,14 +32,21 @@ pub fn encode(message: &SessionMessage) -> Result<Vec<u8>> {
 
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     Ok(frame)
 }
 
-/// Incremental decoder: push bytes as they arrive, pop complete messages.
+/// Encodes a message into a complete frame as plaintext JSON.
+pub fn encode(message: &SessionMessage) -> Result<Vec<u8>> {
+    let payload =
+        serde_json::to_vec(message).map_err(|_| Error::Malformed("session json encode"))?;
+    encode_payload(&payload)
+}
+
+/// Incremental decoder: push bytes as they arrive, pop complete payloads.
 ///
-/// Handles arbitrary fragmentation — a message may be split across any number
-/// of pushes, and several messages may arrive in a single push.
+/// Handles arbitrary fragmentation — a payload may be split across any number
+/// of pushes, and several payloads may arrive in a single push.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
@@ -57,8 +63,8 @@ impl FrameDecoder {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// Returns the next complete message, or `Ok(None)` if more bytes are needed.
-    pub fn next_message(&mut self) -> Result<Option<SessionMessage>> {
+    /// Returns the next complete payload, or `Ok(None)` if more bytes are needed.
+    pub fn next_payload(&mut self) -> Result<Option<Vec<u8>>> {
         if self.buffer.len() < 4 {
             return Ok(None);
         }
@@ -81,13 +87,21 @@ impl FrameDecoder {
             return Ok(None);
         }
 
-        let payload: Vec<u8> = self.buffer.drain(..total).skip(4).collect();
+        Ok(Some(self.buffer.drain(..total).skip(4).collect()))
+    }
+
+    /// Returns the next complete message, or `Ok(None)` if more bytes are needed.
+    ///
+    /// Only valid while the session is still plaintext.
+    pub fn next_message(&mut self) -> Result<Option<SessionMessage>> {
+        let Some(payload) = self.next_payload()? else {
+            return Ok(None);
+        };
         let message = serde_json::from_slice(&payload)
             .map_err(|_| Error::Malformed("session json decode"))?;
         Ok(Some(message))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,6 +27,8 @@ pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,
     DEFAULT_DISCOVERY_PORT, PROTOCOL_VERSION,
 };
+pub use session::channel::Channel;
+pub use session::cipher::{Role, SessionCipher};
 pub use session::frame::{FrameDecoder, MAX_FRAME_LEN};
 pub use session::handshake::{Action, ClientHandshake, HostHandshake, Session, State};
 pub use session::heartbeat::{Heartbeat, HeartbeatAction};

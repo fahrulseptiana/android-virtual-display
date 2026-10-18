@@ -5,16 +5,18 @@
 //! handled on its own thread: the handshake is short, and a slow or hostile
 //! client must not stall the discovery loop.
 //!
-//! Only the handshake exists today — after it succeeds the connection is kept
-//! open and further messages are ignored until the heartbeat/input steps.
+//! The `Welcome` is sent in the clear (the client needs it to derive the key);
+//! everything after it is sealed with the session cipher.
 
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 use log::{debug, info, warn};
-use vd_core::session::frame::{self, FrameDecoder};
-use vd_core::session::handshake::{Action, HostHandshake, State};
+use vd_core::session::channel::Channel;
+use vd_core::session::cipher::{Role, SessionCipher};
+use vd_core::session::frame::FrameDecoder;
+use vd_core::session::handshake::{Action, HostHandshake};
 use vd_core::{Capabilities, HostInfo, Session, SessionMessage};
 
 /// Read buffer for a single `recv`.
@@ -80,8 +82,9 @@ fn serve(
 
     let mut handshake = HostHandshake::new(host, capabilities);
     let mut decoder = FrameDecoder::new();
+    let mut channel = Channel::plaintext();
     let mut buffer = [0u8; READ_BUFFER];
-    let mut announced = false;
+    let mut established = false;
 
     loop {
         let read = match stream.read(&mut buffer) {
@@ -98,11 +101,26 @@ fn serve(
         };
         decoder.push(&buffer[..read]);
 
-        while let Some(message) = decoder.next_message()? {
-            if handshake.state() == State::Established {
+        loop {
+            let payload = match decoder.next_payload() {
+                Ok(Some(payload)) => payload,
+                Ok(None) => break,
+                Err(err) => return Err(err.into()),
+            };
+            let message = match channel.decode(&payload) {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!("discarding message from {peer}: {err}");
+                    return Ok(());
+                }
+            };
+
+            if established {
                 match message {
                     SessionMessage::Ping => {
-                        if let Err(err) = stream.write_all(&frame::encode(&SessionMessage::Pong)?) {
+                        debug!("pong to {peer}");
+                        let frame = channel.encode(&SessionMessage::Pong)?;
+                        if let Err(err) = stream.write_all(&frame) {
                             if is_disconnect(&err) {
                                 return Ok(());
                             }
@@ -115,10 +133,14 @@ fn serve(
                 continue;
             }
 
-            let Action::Reply(reply) = handshake.on_message(message)? else {
+            let action = handshake.on_message(message)?;
+            let Action::Reply(reply) = action else {
                 return Err(IoError::new(ErrorKind::InvalidData, "unexpected host action").into());
             };
-            if let Err(err) = stream.write_all(&frame::encode(&reply)?) {
+
+            // The Welcome is plaintext: the client needs it to derive the key.
+            let frame = channel.encode(&reply)?;
+            if let Err(err) = stream.write_all(&frame) {
                 if is_disconnect(&err) {
                     return Ok(());
                 }
@@ -126,15 +148,15 @@ fn serve(
             }
 
             match handshake.session() {
-                Some(session) if !announced => {
-                    announced = true;
+                Some(session) => {
+                    channel.encrypt(SessionCipher::new(&session.keys.key, Role::Host));
+                    established = true;
                     log_session(session, peer);
                 }
                 None => {
                     info!("rejected control connection from {peer}");
                     return Ok(());
                 }
-                Some(_) => {}
             }
         }
     }
@@ -153,7 +175,7 @@ fn is_disconnect(err: &IoError) -> bool {
 
 fn log_session(session: &Session, peer: SocketAddr) {
     info!(
-        "session established with \"{}\" ({}) from {peer} — protocol v{}, codec {}",
+        "session established with \"{}\" ({}) from {peer} — protocol v{}, codec {}, encrypted",
         session.client.name,
         session.client.platform,
         session.protocol,
