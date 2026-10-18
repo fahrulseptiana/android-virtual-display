@@ -115,18 +115,26 @@ active man-in-the-middle who re-runs the exchange on both sides. See
 
 - [x] Abstraction: `trait FrameSource` returning a frame, so the encoder is
       capture-agnostic, plus a synthetic `TestPattern` source.
-- [ ] **Primary:** DXGI Desktop Duplication — lowest latency, GPU-resident
-      textures, dirty-rect + move-rect metadata.
+- [x] **Primary:** DXGI Desktop Duplication (`vd-host::dxgi`), with
+      `DXGI_ERROR_WAIT_TIMEOUT` and `DXGI_ERROR_ACCESS_LOST` handled (the
+      duplication is rebuilt after mode changes, UAC prompts and locks).
+      Selects the monitor with `VD_OUTPUT`.
+- [x] Stream size is bounded: a 4K frame is downscaled to the target size with
+      a box filter before encoding (the `image` crate's resampler cost 1.7 s per
+      4K frame; the box filter costs 25 ms).
 - [ ] **Fallback:** Windows.Graphics.Capture — needed for some HDR/protected
       cases and per-window capture.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
-- [ ] Handle display changes (resolution, HDR toggle, monitor add/remove).
+- [ ] Pick a monitor at runtime rather than by index; handle monitors appearing
+      and disappearing.
 
 ### Phase 4 — Video encode
 
 - [x] Interim codec: JPEG (`vd-core::codec`), enough to prove the pipeline.
-      Measured on the development machine: **4.8 fps at 1280×800**, 8.5 at
-      960×600, 21 at 640×400 — the pure-Rust encoder is the current bottleneck.
+      Measured from a 3840×2160 desktop streamed at 1280×720 in release:
+      **8.9–13 fps** (box downscale 25 ms, JPEG encode 16 ms per frame). On the
+      tablet the pure-Rust JPEG *decoder* is the client-side limit (~2 fps).
+      Both ends need hardware H.264.
 - [ ] **Primary:** hardware H.264 via Media Foundation MFTs (AMD AMF / NVENC /
       QuickSync), zero-copy from the capture texture.
 - [ ] **Fallback:** software x264 at reduced quality.

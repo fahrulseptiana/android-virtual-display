@@ -12,11 +12,10 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: video works end to end.** The client discovers a host, pairs,
-> opens an encrypted session and displays a live video stream. Capture is still
-> synthetic (a moving test pattern) and the interim JPEG codec runs at ~5 fps at
-> 1280×800, so this is *M3 — first frame*, not yet usable. Real desktop capture
-> (DXGI) and hardware H.264 are next.
+> **Status: real desktop on the tablet.** The client discovers a host, pairs,
+> opens an encrypted session and displays the live Windows desktop, captured
+> with DXGI Desktop Duplication. The interim JPEG codec limits it to a few
+> frames per second (see PLAN.md), so hardware H.264 is the next step.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -118,15 +117,18 @@ kind *inside* the sealed plaintext, so a frame is either a control message or a
 binary video frame (`vd_core::video`): a 26-byte header (version, format,
 dimensions, sequence, timestamp) followed by the encoded image.
 
-The host captures through a `FrameSource`, encodes and fans the result out to
-every client through a `Broadcaster`. Each client gets a single-slot channel, so
-a slow client misses frames instead of queueing them. Capture pauses entirely
+The host captures through a `FrameSource` — DXGI Desktop Duplication on
+Windows, or a synthetic test pattern as a fallback — encodes and fans the
+result out to every client through a `Broadcaster`. Frames larger than the
+configured size are downscaled with a fast box filter first, so a 4K desktop
+becomes a streamable 1280×720. Each client gets a single-slot channel, so a
+slow client misses frames instead of queueing them. Capture pauses entirely
 when nobody is watching.
 
 The client decodes off the UI thread into a one-slot mailbox and uploads the
 newest frame as a texture, so the display never lags behind the stream.
 
-> The interim codec is JPEG. It is slow (≈5 fps at 1280×800) and exists only to
+> The interim codec is JPEG. It is slow (a few fps at 720p) and exists only to
 > prove the pipeline; hardware H.264 is the next step.
 
 ### Security note
@@ -222,8 +224,8 @@ The project deliberately leans on a few principles:
 - [x] Control channel on TCP 47701: handshake, capability exchange, PIN pairing,
       encryption, heartbeats and automatic reconnect
 - [x] Video pipeline end to end: frame protocol, capture abstraction, encoded
-      frames over the encrypted channel, client render (synthetic source + JPEG)
-- [ ] Real desktop capture (DXGI Desktop Duplication)
+      frames over the encrypted channel, client render
+- [x] Real desktop capture (DXGI Desktop Duplication) with stream downscaling
 - [ ] Hardware H.264 encode (Media Foundation) and decode (MediaCodec)
 - [ ] Trust-on-first-use host identity (authenticated pairing)
 - [ ] Touch / keyboard input forwarding
