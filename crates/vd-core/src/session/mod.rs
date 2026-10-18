@@ -34,7 +34,7 @@ use crate::session::pairing::{KEY_LEN, SALT_LEN};
 ///
 /// Independent of [`crate::protocol::PROTOCOL_VERSION`], which version guards the
 /// UDP discovery datagrams.
-pub const SESSION_PROTOCOL_VERSION: u16 = 2;
+pub const SESSION_PROTOCOL_VERSION: u16 = 3;
 
 /// A video codec a peer is able to encode or decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,6 +173,13 @@ pub enum SessionMessage {
         #[serde(default)]
         sent_us: u64,
     },
+    /// Client → host: whether it wants video at all.
+    ///
+    /// Sent when the app goes to the background or comes back, so a host stops
+    /// capturing for a screen nobody is looking at. Resuming re-subscribes the
+    /// client, which asks for a keyframe — without one it could not decode
+    /// anything after the gap.
+    VideoControl { paused: bool },
     /// Reply to a [`SessionMessage::Ping`].
     ///
     /// The three readings let the sender estimate both the round-trip time and
@@ -231,6 +238,7 @@ impl SessionMessage {
             Self::Hello { protocol, .. } | Self::Welcome { protocol, .. } => Some(*protocol),
             Self::Reject { .. }
             | Self::VideoConfig { .. }
+            | Self::VideoControl { .. }
             | Self::Ping { .. }
             | Self::Pong { .. } => None,
         }

@@ -9,12 +9,14 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use log::info;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
 use vd_core::{HostId, HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
 use crate::frames::FrameQueue;
 use crate::latency::Latency;
+use crate::visibility::Visibility;
 
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -22,6 +24,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// How often egui should repaint even without input: keeps the ripple animation
 /// smooth and drains the frame queue promptly.
 const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the accumulated frame timings are written to the log.
+const LATENCY_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A host seen more recently than this is treated as online.
 const ONLINE_WINDOW: Duration = Duration::from_secs(3);
@@ -93,6 +97,16 @@ pub struct VdClientApp {
     retry_target: Option<HostId>,
     /// How long frames are taking, measured by the connection and shown here.
     latency: Latency,
+    /// When to write the next latency summary to the log.
+    next_latency_report: Instant,
+    /// When the drawn-frame count was last reset, for the rate in that summary.
+    last_rate_report: Instant,
+    /// Frames dropped as of the last report, so the delta can be shown.
+    last_dropped: u64,
+    /// Repaints since the last report: the ceiling on frames that can be drawn.
+    repaints: u64,
+    /// When the UI last drew, so video can be paused when it stops.
+    visibility: Visibility,
     /// Decoded frames waiting to be drawn.
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
@@ -106,6 +120,11 @@ impl VdClientApp {
             trust_path,
             retry_target: None,
             latency: Latency::new(),
+            next_latency_report: Instant::now() + LATENCY_REPORT_INTERVAL,
+            last_rate_report: Instant::now(),
+            last_dropped: 0,
+            repaints: 0,
+            visibility: Visibility::new(),
             view: View::Browser,
             browser: None,
             browser_error: None,
@@ -202,14 +221,27 @@ impl VdClientApp {
         }
     }
 
-    /// Uploads one queued frame as a texture.
+    /// Uploads the newest queued frame as a texture.
+    ///
+    /// Newest rather than oldest: anything else on the queue has already been
+    /// overtaken, so drawing it would show the past for no gain. The frames
+    /// skipped over are counted, and a visible rise in that count is the signal
+    /// that this device cannot keep up with the stream.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
-        // One frame per repaint: there is far more repaint headroom than frames,
-        // so the queue stays empty and bursts are not collapsed.
-        let Some(frame) = self.frames.next() else {
+        // The ages are needed to tell a decoder's burst from a backlog, and
+        // only this side knows how the host's clock relates to ours.
+        let latency = self.latency.clone();
+        let Some(frame) = self
+            .frames
+            .take_for_display(|timestamp_us| latency.age_us(timestamp_us))
+        else {
             return;
         };
+        // Age at the moment it is handed over, which is as close to "on screen"
+        // as software can measure.
+        self.latency.record_display(frame.timestamp_us);
 
+        let started = Instant::now();
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
             &frame.pixels,
@@ -220,7 +252,54 @@ impl VdClientApp {
                 self.texture = Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
             }
         }
+        self.latency.record_render(started.elapsed());
         self.frames_seen += 1;
+    }
+
+    /// Writes the timings measured so far to the log, every few seconds.
+    ///
+    /// Reported from here rather than from the connection because the whole
+    /// picture — including how many frames were dropped before they could be
+    /// drawn — only exists on this side of the frame queue.
+    fn report_latency(&mut self) {
+        let now = Instant::now();
+        if now < self.next_latency_report {
+            return;
+        }
+        self.next_latency_report = now + LATENCY_REPORT_INTERVAL;
+
+        let seconds = (now - self.last_rate_report).as_secs_f32();
+        let drawn = std::mem::take(&mut self.frames_seen);
+        let repaints = std::mem::take(&mut self.repaints);
+        self.last_rate_report = now;
+
+        // The queue's counter is for the whole session; what matters here is how
+        // many were dropped during this period.
+        let total_dropped = self.frames.dropped();
+        let dropped = total_dropped.saturating_sub(self.last_dropped);
+        self.last_dropped = total_dropped;
+
+        let Some(readout) = self.latency.summarise(dropped) else {
+            return;
+        };
+        let per_second = |count: u64| {
+            if seconds > 0.0 {
+                count as f32 / seconds
+            } else {
+                0.0
+            }
+        };
+        info!(
+            "frame latency: arrived {:.1} ms, drawn {:.1} ms (p95 {:.1} ms),              decode {:.1} ms, render {:.1} ms — {:.1} fps drawn, {:.1} dropped,              {:.1} repaints/s",
+            readout.arrival.mean_ms(),
+            readout.display.mean_ms(),
+            readout.display.p95_ms(),
+            readout.decode.mean_ms(),
+            readout.render.mean_ms(),
+            per_second(drawn),
+            per_second(dropped),
+            per_second(repaints),
+        );
     }
 
     /// Leaves the stream and returns to the host list.
@@ -255,30 +334,21 @@ impl VdClientApp {
         // A fresh measurement for a fresh connection: the clock offset from the
         // last one means nothing now.
         self.latency = Latency::new();
-        let sinks = connection::Sinks::new(events_tx, self.frames.clone(), self.latency.clone());
+        self.next_latency_report = Instant::now() + LATENCY_REPORT_INTERVAL;
+        self.last_dropped = 0;
+        self.visibility.tick();
+        let sinks = connection::Sinks::new(
+            events_tx,
+            self.frames.clone(),
+            self.latency.clone(),
+            self.visibility.clone(),
+        );
         self.handle = Some(connection::connect(
             addr,
             host,
             sinks,
             self.trust_path.clone(),
         ));
-    }
-
-    fn report_rates(&mut self) {
-        static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
-        let last = LAST.get_or_init(|| std::sync::Mutex::new(Instant::now()));
-        let mut last = last.lock().unwrap();
-        if last.elapsed() < Duration::from_secs(5) {
-            return;
-        }
-        let seconds = last.elapsed().as_secs_f32();
-        log::info!(
-            "rates: {:.1} frames/s drawn, {} queued",
-            self.frames_seen as f32 / seconds,
-            self.frames.len()
-        );
-        self.frames_seen = 0;
-        *last = Instant::now();
     }
 
     /// Skips the rest of a retry delay when discovery shows the host is back.
@@ -328,11 +398,14 @@ impl Default for VdClientApp {
 
 impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.repaints += 1;
+        // Tells the connection that this app still has a screen to draw on.
+        self.visibility.tick();
         self.poll_discovery();
         self.nudge_reconnect();
         self.poll_connection();
         self.refresh_texture(ui.ctx());
-        self.report_rates();
+        self.report_latency();
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
 
         // Android's back button arrives as `BrowserBack`.
@@ -491,7 +564,11 @@ impl VdClientApp {
         // The mean says how it feels, the p95 says how bad it gets.
         if matches!(self.connection, Connection::Connected { .. }) {
             if let Some(readout) = self.latency.latest() {
-                let text = format!("{:.0} ms · p95 {:.0}", readout.mean_ms(), readout.p95_ms());
+                let text = format!(
+                    "{:.0} ms · p95 {:.0}",
+                    readout.display.mean_ms(),
+                    readout.display.p95_ms()
+                );
                 let anchor = rect.left_top() + egui::vec2(10.0, 8.0);
                 let painter = ui.painter();
                 let size = painter.layout_no_wrap(

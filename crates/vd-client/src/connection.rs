@@ -33,6 +33,7 @@ use vd_core::{
 use crate::frames::{DecodedFrame, FrameQueue};
 use crate::latency::Latency;
 use crate::trust::TrustStore;
+use crate::visibility::Visibility;
 
 #[cfg(target_os = "android")]
 pub use crate::media_codec::H264Decoder;
@@ -75,8 +76,6 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// backoff exists only to avoid spinning while a host is down — it does not
 /// need to grow into tens of seconds.
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(500);
-/// How often the frame latency measured so far is summarised into the log.
-const LATENCY_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const READ_BUFFER: usize = 4096;
 
@@ -113,15 +112,23 @@ pub struct Sinks {
     frames: FrameQueue,
     /// How long frames are taking, for the UI.
     latency: Latency,
+    /// Whether the UI is drawing, so video can be paused when it is not.
+    visibility: Visibility,
 }
 
 impl Sinks {
-    /// Groups the three places a worker sends its results.
-    pub fn new(events: Sender<ConnectionEvent>, frames: FrameQueue, latency: Latency) -> Self {
+    /// Groups the places a worker and the UI share state.
+    pub fn new(
+        events: Sender<ConnectionEvent>,
+        frames: FrameQueue,
+        latency: Latency,
+        visibility: Visibility,
+    ) -> Self {
         Self {
             events,
             frames,
             latency,
+            visibility,
         }
     }
 
@@ -323,9 +330,10 @@ fn attempt(
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut heartbeat: Option<Heartbeat> = None;
     // Decoding runs on its own thread so it never blocks the socket.
-    let decode_worker = DecoderWorker::spawn(sinks.frames.clone());
-    // Latency is measured in batches and reported on this cadence.
-    let mut next_latency_report = Instant::now() + LATENCY_REPORT_INTERVAL;
+    let decode_worker = DecoderWorker::spawn(sinks.frames.clone(), sinks.latency.clone());
+    // Whether the host has been asked to stop sending video, so the request is
+    // only sent when the answer changes.
+    let mut video_paused = false;
 
     loop {
         if control.cancelled.load(Ordering::Relaxed) {
@@ -449,16 +457,22 @@ fn attempt(
             None => {}
         }
 
-        if now >= next_latency_report {
-            next_latency_report = now + LATENCY_REPORT_INTERVAL;
-            if let Some(readout) = sinks.latency.summarise() {
-                info!(
-                    "frame latency {:.1} ms average, {:.1} ms p95, {:.1} ms worst — {} frames",
-                    readout.mean_ms(),
-                    readout.p95_ms(),
-                    readout.max_ms(),
-                    readout.samples,
-                );
+        // A paint means a surface; no paint for a while means the app has gone
+        // to the background, and there is nothing to be gained by receiving
+        // video for a screen nobody is looking at.
+        let wanted = sinks.visibility.visible();
+        if wanted == video_paused {
+            video_paused = !wanted;
+            if video_paused {
+                info!("app has stopped drawing — asking the host to pause video");
+            } else {
+                info!("app is drawing again — asking the host to resume video");
+            }
+            let control = SessionMessage::VideoControl {
+                paused: video_paused,
+            };
+            if let Err(err) = write_message(&mut stream, &mut channel, &control) {
+                return Attempt::Disconnected(format!("could not set video state: {err}"));
             }
         }
     }
@@ -574,7 +588,7 @@ fn handle_stream(sinks: &Sinks, worker: &DecoderWorker, frame: Frame) {
             report_wire_sequence(video.header.sequence);
             // Stamp the age as the frame arrives: what happens to it after this
             // is decoding and presentation, not transport.
-            sinks.latency.record(video.header.timestamp_us);
+            sinks.latency.record_arrival(video.header.timestamp_us);
             worker.submit(
                 video.payload.clone(),
                 video.header.sequence,
@@ -610,9 +624,9 @@ struct DecoderWorker {
 }
 
 impl DecoderWorker {
-    fn spawn(frames: FrameQueue) -> Self {
+    fn spawn(frames: FrameQueue, latency: Latency) -> Self {
         let (jobs, receiver) = sync_channel(DECODE_QUEUE);
-        let handle = thread::spawn(move || decode_loop(receiver, frames));
+        let handle = thread::spawn(move || decode_loop(receiver, frames, latency));
         Self {
             jobs: Some(jobs),
             handle: Some(handle),
@@ -749,7 +763,7 @@ fn report_decode_throughput(now: Instant) {
     );
 }
 
-fn decode_loop(jobs: Receiver<DecodeJob>, frames: FrameQueue) {
+fn decode_loop(jobs: Receiver<DecodeJob>, frames: FrameQueue, latency: Latency) {
     let mut decoder: Option<Decoder> = None;
     // One input can yield several pictures (the decoder catching up after a
     // stall). They must not share a sequence, or the UI's "is it new?" check
@@ -783,14 +797,19 @@ fn decode_loop(jobs: Receiver<DecodeJob>, frames: FrameQueue) {
                 let Some(decoder) = decoder.as_mut() else {
                     continue;
                 };
+                let started = Instant::now();
                 match decode_timed(decoder, &payload, timestamp_us) {
                     Ok(images) => {
+                        // The whole call, not just the hardware wait: a decoder
+                        // that is falling behind is what this is meant to show.
+                        latency.record_decode(started.elapsed());
                         record_decode(sequence, images.len());
                         for image in images {
                             frames.publish(DecodedFrame {
                                 sequence: picture_index,
                                 width: image.width,
                                 height: image.height,
+                                timestamp_us,
                                 pixels: image.pixels,
                             });
                             picture_index += 1;
@@ -804,31 +823,15 @@ fn decode_loop(jobs: Receiver<DecodeJob>, frames: FrameQueue) {
     }
 }
 
-/// Decodes one access unit, reporting the average cost every 30 frames.
+/// Decodes one access unit. How long it took is measured by the caller.
 fn decode_timed(
     decoder: &mut Decoder,
     payload: &[u8],
     timestamp_us: u64,
 ) -> Result<Vec<vd_core::codec::RgbaImage>, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static FRAMES: AtomicU64 = AtomicU64::new(0);
-    static MICROS: AtomicU64 = AtomicU64::new(0);
-
-    let started = Instant::now();
-    let result = decoder
+    decoder
         .decode(payload, timestamp_us)
-        .map_err(|err| err.to_string());
-    let elapsed = started.elapsed().as_micros() as u64;
-
-    let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    let micros = MICROS.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
-    if frames % 30 == 0 {
-        info!(
-            "decode: {frames} frames, {:.1} ms average",
-            micros as f64 / frames as f64 / 1000.0
-        );
-    }
-    result
+        .map_err(|err| err.to_string())
 }
 
 /// Complains about a codec we cannot decode, once.
@@ -849,6 +852,7 @@ fn publish_frame(frames: &FrameQueue, video: &VideoFrame) {
             sequence: video.header.sequence,
             width: image.width,
             height: image.height,
+            timestamp_us: video.header.timestamp_us,
             pixels: image.pixels,
         }),
         Err(err) => {

@@ -219,6 +219,20 @@ fn serve(
 
             if established {
                 match message {
+                    // The client is not looking at the screen: stop feeding it
+                    // frames, which lets the capture loop idle when nobody is
+                    // watching. Re-subscribing asks for a keyframe, without
+                    // which the gap would leave the decoder lost.
+                    SessionMessage::VideoControl { paused } => {
+                        if paused {
+                            if video_rx.take().is_some() {
+                                info!("{peer} is not looking — video paused");
+                            }
+                        } else if video_rx.is_none() {
+                            video_rx = Some(video.subscribe());
+                            info!("{peer} is watching again — video resumed");
+                        }
+                    }
                     SessionMessage::Ping { sent_us } => {
                         debug!("pong to {peer}");
                         let pong = SessionMessage::Pong {

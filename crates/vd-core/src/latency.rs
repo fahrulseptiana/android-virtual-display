@@ -135,17 +135,20 @@ impl ClockSync {
     }
 }
 
-/// A run of age measurements, summarised.
+/// A run of microsecond measurements, summarised.
+///
+/// Used for frame ages, but equally for durations — how long a decode or a
+/// texture upload took — since both are just numbers of microseconds.
 ///
 /// Deliberately not a rolling window: the caller records a batch and then reads
 /// the summary out, which keeps the arithmetic simple and the memory bounded by
 /// however often it reports.
 #[derive(Clone, Debug, Default)]
-pub struct AgeStats {
+pub struct SampleStats {
     samples: Vec<i64>,
 }
 
-impl AgeStats {
+impl SampleStats {
     /// Creates an empty set of measurements.
     pub fn new() -> Self {
         Self::default()
@@ -153,8 +156,8 @@ impl AgeStats {
 
     /// Adds one measurement, in microseconds. Negative ages are kept, since a
     /// cluster of them means the offset estimate needs looking at.
-    pub fn record(&mut self, age_us: i64) {
-        self.samples.push(age_us);
+    pub fn record(&mut self, value_us: i64) {
+        self.samples.push(value_us);
     }
 
     /// Number of measurements taken.
@@ -172,16 +175,16 @@ impl AgeStats {
         self.samples.clear();
     }
 
-    /// Mean age, or `None` if nothing was measured.
+    /// Mean value, or `None` if nothing was measured.
     pub fn mean_us(&self) -> Option<i64> {
         if self.samples.is_empty() {
             return None;
         }
-        let total: i128 = self.samples.iter().map(|&age| age as i128).sum();
+        let total: i128 = self.samples.iter().map(|&value| value as i128).sum();
         i64::try_from(total / self.samples.len() as i128).ok()
     }
 
-    /// Age at the given percentile, by the nearest-rank method. `0.95` gives a
+    /// Value at the given percentile, by the nearest-rank method. `0.95` gives a
     /// value that 95% of measurements were at or below.
     pub fn percentile_us(&self, percentile: f32) -> Option<i64> {
         if self.samples.is_empty() {
@@ -196,12 +199,12 @@ impl AgeStats {
         Some(sorted[index])
     }
 
-    /// Largest age seen.
+    /// Largest value seen.
     pub fn max_us(&self) -> Option<i64> {
         self.samples.iter().copied().max()
     }
 
-    /// Smallest age seen.
+    /// Smallest value seen.
     pub fn min_us(&self) -> Option<i64> {
         self.samples.iter().copied().min()
     }
@@ -338,7 +341,7 @@ mod tests {
 
     #[test]
     fn stats_summarise_a_batch() {
-        let mut stats = AgeStats::new();
+        let mut stats = SampleStats::new();
         assert!(stats.is_empty());
         assert_eq!(stats.mean_us(), None);
         assert_eq!(stats.percentile_us(0.95), None);
@@ -362,7 +365,7 @@ mod tests {
 
     #[test]
     fn stats_are_unbothered_by_an_unsorted_batch() {
-        let mut stats = AgeStats::new();
+        let mut stats = SampleStats::new();
         for value in [30, 10, 50, 20, 40] {
             stats.record(value);
         }

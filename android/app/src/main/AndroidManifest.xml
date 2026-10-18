@@ -8,7 +8,7 @@
     <application
         android:label="VD Client"
         android:hasCode="false"
-        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        android:theme="@style/VdFullscreen">
 
         <!--
             The entry point is the platform's NativeActivity, which loads
@@ -19,7 +19,7 @@
             android:label="VD Client"
             android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|uiMode"
-            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            android:theme="@style/VdFullscreen">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

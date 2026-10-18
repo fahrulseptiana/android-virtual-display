@@ -304,15 +304,33 @@ attacking directly.
       while searching, a tappable host list (name, platform, address, online
       dot), and the desktop full-screen with Android's back button returning to
       the list and disconnecting.
-- [ ] Zero-copy output is an efficiency rather than a speed matter now: decoding
-      to a `Surface` would remove the ~13 ms YUV→RGBA conversion and the ~9 ms
-      texture upload, saving CPU and power, but the display already matches the
-      host. It costs the egui overlay, so only worth doing if measurements show
-      we are CPU or thermally bound.
-- [ ] Adaptive: drop late frames rather than queueing; track decode/render
-      timings against the latency budget.
-- [ ] Handle rotation, notch/cutout, and backgrounding (pause capture when the
-      app is not visible).
+- [ ] Zero-copy output. **This is no longer merely an efficiency matter.** The
+      measurements added in point 7 put the client at 19-25 ms decoding and 7-9
+      ms building and uploading each texture, against 41 ms to arrive — so the
+      client's own work is roughly what the whole 50 ms budget allows, and the
+      display lands at 96-136 ms. Decoding to a `Surface` would remove the
+      YUV→RGBA conversion and the texture upload together. It costs the egui
+      overlay, so it needs the overlay drawn over the surface rather than the
+      texture drawn by egui.
+- [x] Adaptive: a frame is drawn unless it has fallen more than 70 ms behind
+      the freshest one waiting, in which case it is dropped and counted. It is
+      *not* simply newest-wins: that was tried first, and halved the drawn rate
+      to 14 fps of 28, because the decoder returns two pictures at once and
+      there are 53 repaint slots per second for 28 frames. Dropping only what is
+      genuinely late keeps motion smooth — 26-28 fps drawn, ~0 dropped — while
+      still refusing to draw the past after a stall.
+- [x] Decode and render timings are tracked against the budget alongside the
+      arrival age, the display age, the drawn rate and the drop count, in one
+      line every five seconds. They say the client is over budget: see below.
+- [x] Handle rotation, notch/cutout, and backgrounding. Rotation needs no code
+      (`configChanges` keeps the activity alive and the view scales to fit).
+      The cutout is handled by a theme with `windowLayoutInDisplayCutoutMode`
+      set to `shortEdges`, so the screen is used rather than letterboxed away
+      from a notch — unverifiable here, as this tablet has no cutout.
+      Backgrounding is detected by the UI going quiet, and the client asks the
+      host to stop sending; the host drops its subscription and the capture loop
+      idles. Resuming re-subscribes, which asks for a keyframe — without one the
+      decoder could not pick up after the gap.
 - [ ] Software keyboard for hosts that need it (Phase 7).
 
 ### Phase 7 — Input forwarding

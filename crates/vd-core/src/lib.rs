@@ -37,7 +37,7 @@ pub use codec::{
     decode_rgba, encode_jpeg, fit_frame, fit_within, CodecError, EncodedImage, RgbaImage,
 };
 pub use error::{Error, Result};
-pub use latency::{AgeStats, ClockOffset, ClockSync};
+pub use latency::{ClockOffset, ClockSync, SampleStats};
 pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,
     DEFAULT_DISCOVERY_PORT, PROTOCOL_VERSION,

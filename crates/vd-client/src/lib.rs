@@ -15,6 +15,7 @@ pub mod logging;
 #[cfg(target_os = "android")]
 pub mod media_codec;
 pub mod trust;
+pub mod visibility;
 
 pub const APP_NAME: &str = "VD Client";
 
