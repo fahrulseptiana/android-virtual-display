@@ -14,6 +14,8 @@
 //! the advertised name.
 
 mod control;
+#[cfg(windows)]
+mod dxgi;
 mod identity;
 mod video;
 
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
-use vd_core::capture::TestPattern;
+use vd_core::capture::{FrameSource, TestPattern};
 use vd_core::discovery::{DiscoveryConfig, Responder};
 use vd_core::{Capabilities, HostInfo};
 
@@ -41,8 +43,9 @@ fn main() -> vd_core::Result<()> {
     let broadcaster = video::Broadcaster::new();
     video::spawn_capture(
         broadcaster.clone(),
-        Box::new(TestPattern::new(width, height)),
+        capture_source(width, height),
         fps,
+        (width, height),
     );
 
     let control =
@@ -86,6 +89,24 @@ fn main() -> vd_core::Result<()> {
 /// codec is advertised; input forwarding is planned.
 fn host_capabilities() -> Capabilities {
     Capabilities::default()
+}
+
+/// Picks the best available capture source: DXGI on Windows, else a test pattern.
+///
+/// `VD_OUTPUT` selects the monitor index (default 0).
+fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
+    #[cfg(windows)]
+    {
+        let output = std::env::var("VD_OUTPUT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        match dxgi::DxgiCapture::new(output) {
+            Ok(capture) => return Box::new(capture),
+            Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
+        }
+    }
+    Box::new(TestPattern::new(width, height))
 }
 
 /// Stream geometry, overridable with `VD_VIDEO_SIZE=WxH` and `VD_VIDEO_FPS`.

@@ -30,7 +30,9 @@ pub mod video;
 mod test_support;
 
 pub use capture::{CaptureError, CapturedFrame, FrameSource};
-pub use codec::{decode_rgba, encode_jpeg, CodecError, EncodedImage, RgbaImage};
+pub use codec::{
+    decode_rgba, encode_jpeg, fit_frame, fit_within, CodecError, EncodedImage, RgbaImage,
+};
 pub use error::{Error, Result};
 pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,

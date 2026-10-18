@@ -47,6 +47,124 @@ pub enum CodecError {
     Codec(String),
 }
 
+/// The size `width`×`height` shrinks to so that it fits inside `max_width`×`max_height`,
+/// preserving the aspect ratio. Returns the input size when it already fits.
+pub fn fit_within(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
+        return (width, height);
+    }
+    if width <= max_width && height <= max_height {
+        return (width, height);
+    }
+
+    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
+    let scaled_width = ((width as f64 * scale).round() as u32).max(1);
+    let scaled_height = ((height as f64 * scale).round() as u32).max(1);
+    (scaled_width, scaled_height)
+}
+
+/// Downscales a captured frame to fit within `max_width`×`max_height`.
+///
+/// A full-resolution desktop is far more than a tablet can display and far more
+/// than the encoder can keep up with, so the stream is bounded here rather than
+/// at the client. Takes ownership so the common "already fits" case is free.
+pub fn fit_frame(
+    frame: CapturedFrame,
+    max_width: u32,
+    max_height: u32,
+) -> Result<CapturedFrame, CodecError> {
+    let (width, height) = fit_within(frame.width, frame.height, max_width, max_height);
+    if (width, height) == (frame.width, frame.height) {
+        return Ok(frame);
+    }
+
+    let data = box_downscale(
+        &frame.data,
+        frame.format,
+        frame.width,
+        frame.height,
+        width,
+        height,
+    )?;
+
+    Ok(CapturedFrame {
+        width,
+        height,
+        format: FrameFormat::RawRgba,
+        timestamp_us: frame.timestamp_us,
+        data,
+    })
+}
+
+/// Box-filter downscale that reads `format` pixels and writes RGBA.
+///
+/// The `image` crate's general resampler costs ~1.7 s on a 4K frame, which is
+/// useless for a live stream. A box filter is O(source pixels) with integer math
+/// — tens of milliseconds for 4K — and looks fine for a desktop.
+fn box_downscale(
+    data: &[u8],
+    format: FrameFormat,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Result<Vec<u8>, CodecError> {
+    let bytes_per_pixel = format
+        .bytes_per_pixel()
+        .ok_or(CodecError::Unsupported(format))?;
+    let expected = src_width as usize * src_height as usize * bytes_per_pixel;
+    if data.len() < expected {
+        return Err(CodecError::SizeMismatch);
+    }
+    let swap_red_blue = matches!(format, FrameFormat::RawBgra);
+
+    let mut out = vec![0u8; dst_width as usize * dst_height as usize * 4];
+    for dy in 0..dst_height {
+        let (y0, y1) = span(dy, src_height, dst_height);
+        for dx in 0..dst_width {
+            let (x0, x1) = span(dx, src_width, dst_width);
+
+            let (mut red, mut green, mut blue, mut alpha) = (0u32, 0u32, 0u32, 0u32);
+            let mut count = 0u32;
+            for y in y0..y1 {
+                let row = y as usize * src_width as usize * bytes_per_pixel;
+                for x in x0..x1 {
+                    let i = row + x as usize * bytes_per_pixel;
+                    if swap_red_blue {
+                        blue += u32::from(data[i]);
+                        green += u32::from(data[i + 1]);
+                        red += u32::from(data[i + 2]);
+                    } else {
+                        red += u32::from(data[i]);
+                        green += u32::from(data[i + 1]);
+                        blue += u32::from(data[i + 2]);
+                    }
+                    alpha += u32::from(data[i + 3]);
+                    count += 1;
+                }
+            }
+
+            let count = count.max(1);
+            let o = (dy as usize * dst_width as usize + dx as usize) * 4;
+            out[o] = (red / count) as u8;
+            out[o + 1] = (green / count) as u8;
+            out[o + 2] = (blue / count) as u8;
+            out[o + 3] = (alpha / count) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// The half-open source range `[start, end)` covered by output index `index`.
+fn span(index: u32, source: u32, destination: u32) -> (u32, u32) {
+    let index = u64::from(index);
+    let source = u64::from(source);
+    let destination = u64::from(destination);
+    let start = index * source / destination;
+    let end = (index + 1) * source / destination + 1;
+    (start as u32, end.min(source) as u32)
+}
+
 /// Encodes a captured image as JPEG.
 pub fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<EncodedImage, CodecError> {
     let rgba = to_rgba(frame.width, frame.height, frame.format, &frame.data)?;
@@ -206,6 +324,25 @@ mod tests {
             frame.data,
         );
         assert_eq!(decode_rgba(&video).unwrap().pixels, vec![30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn fit_within_preserves_aspect_ratio() {
+        assert_eq!(fit_within(3840, 2160, 1280, 800), (1280, 720));
+        assert_eq!(fit_within(1280, 800, 1280, 800), (1280, 800));
+        assert_eq!(fit_within(800, 600, 1280, 800), (800, 600));
+        // Zero means "no limit".
+        assert_eq!(fit_within(3840, 2160, 0, 0), (3840, 2160));
+    }
+
+    #[test]
+    fn fit_frame_downscales_and_keeps_timestamps() {
+        let frame = gradient(64, 32);
+        let fitted = fit_frame(frame.clone(), 32, 32).unwrap();
+        assert_eq!((fitted.width, fitted.height), (32, 16));
+        assert_eq!(fitted.format, FrameFormat::RawRgba);
+        assert_eq!(fitted.data.len(), 32 * 16 * 4);
+        assert_eq!(fitted.timestamp_us, frame.timestamp_us);
     }
 
     #[test]

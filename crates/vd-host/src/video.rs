@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 use vd_core::capture::FrameSource;
-use vd_core::codec::{encode_jpeg, DEFAULT_JPEG_QUALITY};
+use vd_core::codec::{encode_jpeg, fit_frame, DEFAULT_JPEG_QUALITY};
 use vd_core::video::{FrameHeader, VideoFrame};
 
 /// Default stream size while the synthetic source is in use.
@@ -62,10 +62,14 @@ impl Broadcaster {
 }
 
 /// Spawns the capture/encode loop feeding `broadcaster`.
+///
+/// Frames larger than `max_size` are downscaled before encoding, so the stream
+/// is bounded no matter what the desktop resolution is.
 pub fn spawn_capture(
     broadcaster: Arc<Broadcaster>,
     mut source: Box<dyn FrameSource + Send>,
     fps: u32,
+    max_size: (u32, u32),
 ) {
     let frame_interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
     info!("capture source: {}", source.describe());
@@ -74,6 +78,8 @@ pub fn spawn_capture(
         let mut sequence = 0u64;
         let mut streaming = false;
         let mut published = 0u32;
+        let mut scale_ms = 0.0f64;
+        let mut encode_ms = 0.0f64;
         let mut last_report = Instant::now();
         loop {
             let started = Instant::now();
@@ -91,21 +97,34 @@ pub fn spawn_capture(
 
             if watching {
                 match source.next_frame() {
-                    Ok(Some(captured)) => match encode_jpeg(&captured, DEFAULT_JPEG_QUALITY) {
-                        Ok(encoded) => {
-                            let header = FrameHeader {
-                                sequence,
-                                width: encoded.width,
-                                height: encoded.height,
-                                format: encoded.format,
-                                timestamp_us: captured.timestamp_us,
-                            };
-                            sequence = sequence.wrapping_add(1);
-                            published += 1;
-                            broadcaster.publish(Arc::new(VideoFrame::new(header, encoded.data)));
+                    Ok(Some(captured)) => {
+                        let timestamp_us = captured.timestamp_us;
+                        let scale_start = Instant::now();
+                        let fitted = fit_frame(captured, max_size.0, max_size.1);
+                        scale_ms += scale_start.elapsed().as_secs_f64() * 1000.0;
+
+                        let encode_start = Instant::now();
+                        let encoded =
+                            fitted.and_then(|frame| encode_jpeg(&frame, DEFAULT_JPEG_QUALITY));
+                        encode_ms += encode_start.elapsed().as_secs_f64() * 1000.0;
+
+                        match encoded {
+                            Ok(encoded) => {
+                                let header = FrameHeader {
+                                    sequence,
+                                    width: encoded.width,
+                                    height: encoded.height,
+                                    format: encoded.format,
+                                    timestamp_us,
+                                };
+                                sequence = sequence.wrapping_add(1);
+                                published += 1;
+                                broadcaster
+                                    .publish(Arc::new(VideoFrame::new(header, encoded.data)));
+                            }
+                            Err(err) => warn!("could not encode a frame: {err}"),
                         }
-                        Err(err) => warn!("could not encode a frame: {err}"),
-                    },
+                    }
                     Ok(None) => {}
                     Err(err) => {
                         error!("capture failed: {err}");
@@ -118,13 +137,21 @@ pub fn spawn_capture(
                 thread::sleep(remaining);
             }
 
-            // Report the achieved rate so encode cost is visible in the logs.
+            // Report the achieved rate so the pipeline cost is visible in logs.
             if last_report.elapsed() >= Duration::from_secs(5) {
                 let seconds = last_report.elapsed().as_secs_f32();
                 if streaming {
-                    debug!("encoding at {:.1} fps", published as f32 / seconds);
+                    let per_frame = published.max(1) as f64;
+                    debug!(
+                        "encoding at {:.1} fps (scale {:.0} ms, encode {:.0} ms per frame)",
+                        published as f32 / seconds,
+                        scale_ms / per_frame,
+                        encode_ms / per_frame,
+                    );
                 }
                 published = 0;
+                scale_ms = 0.0;
+                encode_ms = 0.0;
                 last_report = Instant::now();
             }
         }

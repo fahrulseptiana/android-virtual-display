@@ -2642,6 +2642,7 @@ dependencies = [
  "log",
  "uuid",
  "vd-core",
+ "windows",
 ]
 
 [[package]]
