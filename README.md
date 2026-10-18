@@ -156,9 +156,13 @@ instead of latency.
 
 ### Security note
 
-The channel is encrypted, but pairing is not yet authenticated end-to-end: the
-host does not display the PIN, so an active man-in-the-middle is not detected.
-Trust-on-first-use host identity is the next hardening step — see
+The channel is encrypted, and the host has a **long-lived identity key** that the
+session key is bound to: the client remembers it the first time the user approves
+a PIN and challenges anything different afterwards. That both closes the silent
+man-in-the-middle hole and removes the PIN prompt on reconnects.
+
+The *first* pairing is still unauthenticated in the strict sense — the host does
+not display the PIN, so there is nothing to compare out of band. See
 [PLAN.md](PLAN.md#security).
 
 ---
@@ -275,7 +279,7 @@ The project deliberately leans on a few principles:
 - [x] Mouse cursor mirrored from the host
 - [x] Client UI: searching ripple → host list → full-screen, back to return
 - [ ] Touch / keyboard input forwarding
-- [ ] Trust-on-first-use host identity (authenticated pairing)
+- [x] Trust-on-first-use host identity (authenticated pairing, silent reconnects)
 - [ ] Zero-copy: D3D11 video processor on the host, Surface on the client
       (efficiency, not speed — see PLAN.md)
 

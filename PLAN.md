@@ -159,11 +159,16 @@ A reliable, encrypted TCP session on `HostInfo::control_port` (47701).
 - [x] `vd-core::session` — handshake, pairing, framing and cipher, all
       transport-agnostic and unit tested.
 
-**Known limitation:** the host does not display the PIN, so the PIN is a
-client-side approval gate rather than an out-of-band comparison. It protects
-against passive eavesdroppers (the channel is encrypted) but not against an
-active man-in-the-middle who re-runs the exchange on both sides. See
-[Security](#security) for the planned fix (trust-on-first-use host key).
+The host publishes a **long-lived identity key**, and the session key is derived
+from both the ephemeral exchange and a Diffie-Hellman against that identity, so
+only a host holding the private half can complete the handshake. The client
+records the identity the first time the user approves a PIN and accepts that key
+silently afterwards — see [Security](#security).
+
+**Remaining limitation:** the host still does not display the PIN, so the *first*
+pairing remains open to an active man-in-the-middle — an inherent property of
+trust on first use without an out-of-band comparison. Every later connection is
+protected, because a different key is challenged.
 
 ### Phase 3 — Desktop capture (Windows)
 
@@ -300,12 +305,15 @@ limitation in Phase 2. Plan:
 
 - [x] Encrypt the session (ChaCha20-Poly1305, per-direction keys).
 - [x] Host proves key knowledge to the client (key-confirmation tag).
-- [ ] Trust on first use: the host gets a persistent identity key; the client
-      stores it after the first pairing and refuses to talk to a different one
-      without warning. This is what turns the PIN into a real check.
-- [ ] Bind the session key to that identity so a MITM cannot re-key silently.
-
-Document the threat model (LAN attacker, rogue host) in `SECURITY.md`.
+- [x] Trust on first use: the host has a persistent identity key, and the client
+      stores it after the first pairing. A different key is challenged and
+      clearly labelled, which is what separates a re-installed host from an
+      impostor.
+- [x] Bind the session key to that identity, so a man-in-the-middle cannot
+      re-key silently — it cannot derive the session key at all without the
+      host's private key.
+- [ ] Document the threat model (LAN attacker, rogue host) in `SECURITY.md`.
+      That document does not exist yet; the summary above is all there is.
 
 ### Performance budgets (1080p60)
 
