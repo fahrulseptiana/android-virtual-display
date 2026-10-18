@@ -151,6 +151,15 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_heartbeat_frames() {
+        for message in [SessionMessage::Ping, SessionMessage::Pong] {
+            let mut decoder = FrameDecoder::new();
+            decoder.push(&encode(&message).unwrap());
+            assert_eq!(decoder.next_message().unwrap(), Some(message));
+        }
+    }
+
+    #[test]
     fn rejects_an_oversized_length_prefix() {
         let mut decoder = FrameDecoder::new();
         decoder.push(&(MAX_FRAME_LEN + 1).to_be_bytes());

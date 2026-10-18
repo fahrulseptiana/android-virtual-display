@@ -1,22 +1,30 @@
-//! Headless end-to-end probe: discover a host, then open a control session.
+//! Headless end-to-end probe: discover a host, open a control session and keep
+//! it alive (watch heartbeats and reconnection happen).
 //!
 //! ```text
-//! cargo run -p vd-client --example connect
+//! cargo run -p vd-client --example connect           # hold for 10s
+//! VD_HOLD=30 cargo run -p vd-client --example connect
 //! ```
 //!
 //! Useful for verifying the control channel without a GUI or a device.
 
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use vd_client::connection::{self, ConnectionEvent};
+use vd_client::connection;
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_HOLD: Duration = Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let hold = std::env::var("VD_HOLD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_HOLD);
 
     let mut browser = Browser::bind(DiscoveryConfig::default())?;
     let deadline = Instant::now() + DISCOVER_TIMEOUT;
@@ -37,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "discovered \"{}\" at {} — connecting…",
+        "discovered \"{}\" at {} — connecting for {hold:?}…",
         host.info.name,
         host.control_addr()
     );
@@ -45,17 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (events_tx, events_rx) = channel();
     connection::connect(host.control_addr(), host.info.clone(), events_tx);
 
-    match events_rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(ConnectionEvent::Established(session)) => println!(
-            "established: protocol v{}, codec {}",
-            session.protocol,
-            session
-                .codec
-                .map(|codec| format!("{codec:?}"))
-                .unwrap_or_else(|| "none".to_owned())
-        ),
-        Ok(other) => println!("connection ended: {other:?}"),
-        Err(err) => println!("no response: {err}"),
+    let deadline = Instant::now() + hold;
+    while Instant::now() < deadline {
+        match events_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => println!("  {event:?}"),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     Ok(())

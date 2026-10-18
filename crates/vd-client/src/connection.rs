@@ -1,151 +1,226 @@
 //! Client-side control connection.
 //!
-//! Opens a TCP connection to a chosen host, runs the [`ClientHandshake`] and
-//! reports the outcome back to the UI over a channel. Each connection lives on
-//! its own thread so the egui repaint loop is never blocked by network I/O.
+//! Owns the whole lifecycle of a session: TCP connect, handshake, heartbeats,
+//! and reconnection with exponential backoff. Everything runs on a dedicated
+//! thread and reports progress to the UI over a channel, so the egui repaint
+//! loop never blocks on network I/O.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use vd_core::session::frame::{self, FrameDecoder};
-use vd_core::session::handshake::{Action, ClientHandshake, State};
+use vd_core::session::handshake::{Action, ClientHandshake};
 use vd_core::{
-    Capabilities, ClientInfo, HostInfo, InputCapabilities, Platform, RejectReason, Session,
-    VideoCodec,
+    Capabilities, ClientInfo, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities, Platform,
+    RejectReason, Session, SessionMessage, VideoCodec,
 };
 
-/// Connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `read` blocks before we get a chance to poll the heartbeat.
+const READ_POLL: Duration = Duration::from_millis(500);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const READ_BUFFER: usize = 4096;
 
 /// What the connection thread reports back to the UI.
 #[derive(Debug)]
 pub enum ConnectionEvent {
+    /// An attempt is starting; `note` carries the previous failure, if any.
+    Connecting { host: String, note: Option<String> },
     /// Handshake succeeded.
     Established(Box<Session>),
-    /// The host refused the session.
-    Rejected { host: String, reason: RejectReason },
-    /// Something went wrong before or during the handshake.
+    /// An attempt failed; the worker will retry after a backoff.
     Failed { host: String, error: String },
-    /// The host closed the connection.
-    Closed { host: String },
+    /// The host refused the session — terminal, the worker stops.
+    Rejected { host: String, reason: RejectReason },
 }
 
-/// Spawns a thread that connects to `addr` and handshakes with `host`.
+/// Spawns a thread that keeps a session to `host` alive, reconnecting as needed.
 pub fn connect(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) {
-    thread::spawn(move || run(addr, host, events));
+    thread::spawn(move || supervise(addr, host, events));
 }
 
-fn run(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) {
-    let name = host.name.clone();
+/// Connects, and keeps reconnecting until the host rejects us or the UI is gone.
+fn supervise(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) {
+    let mut delay = INITIAL_RECONNECT_DELAY;
+    let mut previous_error: Option<String> = None;
 
-    let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-        Ok(stream) => stream,
-        Err(err) => {
-            let _ = events.send(ConnectionEvent::Failed {
-                host: name,
-                error: err.to_string(),
-            });
+    loop {
+        debug!("connecting to {}", host.name);
+        if events
+            .send(ConnectionEvent::Connecting {
+                host: host.name.clone(),
+                note: previous_error.take(),
+            })
+            .is_err()
+        {
+            return; // the UI is gone
+        }
+
+        match attempt(addr, &events) {
+            Attempt::Disconnected(error) => {
+                // We had a session, so retry promptly.
+                warn!("session with {} ended: {error}", host.name);
+                delay = INITIAL_RECONNECT_DELAY;
+                previous_error = Some(error);
+            }
+            Attempt::Failed(error) => {
+                warn!(
+                    "connection to {} failed: {error}; retrying in {delay:?}",
+                    host.name
+                );
+                delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+                previous_error = Some(error);
+            }
+            Attempt::Rejected(reason) => {
+                let _ = events.send(ConnectionEvent::Rejected {
+                    host: host.name.clone(),
+                    reason,
+                });
+                return;
+            }
+        }
+
+        let error = previous_error.clone().unwrap_or_default();
+        if events
+            .send(ConnectionEvent::Failed {
+                host: host.name.clone(),
+                error,
+            })
+            .is_err()
+        {
             return;
         }
+        thread::sleep(delay);
+    }
+}
+
+/// How a single connection attempt ended.
+enum Attempt {
+    /// A session was established and later dropped.
+    Disconnected(String),
+    /// A session was never established.
+    Failed(String),
+    /// The host refused the session.
+    Rejected(RejectReason),
+}
+
+fn attempt(addr: SocketAddr, events: &Sender<ConnectionEvent>) -> Attempt {
+    let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(err) => return Attempt::Failed(format!("could not connect: {err}")),
     };
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(READ_POLL));
     info!("control connection to {addr} established, sending hello");
 
     let mut handshake = ClientHandshake::new(client_info(), client_capabilities());
-    if let Err(err) = write_frame(&mut stream, &handshake.hello()) {
-        let _ = events.send(ConnectionEvent::Failed {
-            host: name,
-            error: err.to_string(),
-        });
-        return;
+    if let Err(err) = write_message(&mut stream, &handshake.hello()) {
+        return Attempt::Failed(format!("could not send hello: {err}"));
     }
 
     let mut decoder = FrameDecoder::new();
     let mut buffer = [0u8; READ_BUFFER];
+    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut heartbeat: Option<Heartbeat> = None;
 
     loop {
-        let read = match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => {
-                let _ = events.send(ConnectionEvent::Failed {
-                    host: name,
-                    error: err.to_string(),
-                });
-                return;
-            }
-        };
-        decoder.push(&buffer[..read]);
+        let now = Instant::now();
+        match stream.read(&mut buffer) {
+            Ok(0) => return Attempt::Disconnected("host closed the connection".to_owned()),
+            Ok(read) => {
+                decoder.push(&buffer[..read]);
+                loop {
+                    let message = match decoder.next_message() {
+                        Ok(Some(message)) => message,
+                        Ok(None) => break,
+                        Err(err) => return Attempt::Disconnected(err.to_string()),
+                    };
 
-        loop {
-            let message = match decoder.next_message() {
-                Ok(Some(message)) => message,
-                Ok(None) => break,
-                Err(err) => {
-                    let _ = events.send(ConnectionEvent::Failed {
-                        host: name,
-                        error: err.to_string(),
-                    });
-                    return;
-                }
-            };
-
-            // After the handshake the channel is idle until the heartbeat step.
-            if handshake.state() == State::Established {
-                continue;
-            }
-
-            match handshake.on_message(message) {
-                Ok(Action::Established(session)) => {
-                    info!(
-                        "session established with \"{}\" — protocol v{}, codec {}",
-                        session.host.name,
-                        session.protocol,
-                        session
-                            .codec
-                            .map(|codec| format!("{codec:?}"))
-                            .unwrap_or_else(|| "none".to_owned()),
-                    );
-                    if events
-                        .send(ConnectionEvent::Established(Box::new(session)))
-                        .is_err()
-                    {
-                        return;
+                    if let Some(beat) = heartbeat.as_mut() {
+                        // Any traffic proves the host is alive.
+                        beat.on_activity(now);
+                    } else {
+                        match handshake.on_message(message) {
+                            Ok(Action::Established(session)) => {
+                                info!(
+                                    "session established with \"{}\" — protocol v{}, codec {}",
+                                    session.host.name,
+                                    session.protocol,
+                                    codec_name(session.codec),
+                                );
+                                heartbeat = Some(Heartbeat::new(
+                                    HEARTBEAT_INTERVAL,
+                                    HEARTBEAT_TIMEOUT,
+                                    now,
+                                ));
+                                if events
+                                    .send(ConnectionEvent::Established(Box::new(session)))
+                                    .is_err()
+                                {
+                                    return Attempt::Disconnected("ui closed".to_owned());
+                                }
+                            }
+                            Ok(Action::Rejected(reason)) => return Attempt::Rejected(reason),
+                            // A client never has to reply during the handshake.
+                            Ok(Action::Reply(_)) => {}
+                            Err(err) => return Attempt::Disconnected(err.to_string()),
+                        }
                     }
                 }
-                Ok(Action::Rejected(reason)) => {
-                    warn!("host {name} rejected the session: {reason:?}");
-                    let _ = events.send(ConnectionEvent::Rejected { host: name, reason });
-                    return;
-                }
-                Ok(Action::Reply(_)) => {
-                    // A client never has to reply during the handshake.
-                }
-                Err(err) => {
-                    let _ = events.send(ConnectionEvent::Failed {
-                        host: name,
-                        error: err.to_string(),
-                    });
-                    return;
-                }
             }
+            Err(err) if is_read_timeout(&err) => {}
+            Err(err) => return Attempt::Disconnected(format!("read failed: {err}")),
+        }
+
+        let now = Instant::now();
+        match heartbeat.as_mut() {
+            Some(beat) => match beat.poll(now) {
+                HeartbeatAction::SendPing => {
+                    if let Err(err) = write_message(&mut stream, &SessionMessage::Ping) {
+                        return Attempt::Disconnected(format!("could not send ping: {err}"));
+                    }
+                }
+                HeartbeatAction::TimedOut => {
+                    let silence = beat.silence(now);
+                    return Attempt::Disconnected(format!(
+                        "host silent for {:.1}s",
+                        silence.as_secs_f32()
+                    ));
+                }
+                HeartbeatAction::Idle => {}
+            },
+            None if now >= handshake_deadline => {
+                return Attempt::Failed("handshake timed out".to_owned())
+            }
+            None => {}
         }
     }
-
-    let _ = events.send(ConnectionEvent::Closed { host: name });
 }
 
-fn write_frame(stream: &mut TcpStream, message: &vd_core::SessionMessage) -> std::io::Result<()> {
-    let frame = frame::encode(message)
-        .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-    stream.write_all(&frame)?;
-    stream.flush()
+/// A socket read timeout is reported as `TimedOut` on Windows and `WouldBlock`
+/// on Unix; both simply mean "check the heartbeat and read again".
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+fn write_message(stream: &mut TcpStream, message: &SessionMessage) -> Result<(), String> {
+    let frame = frame::encode(message).map_err(|err| err.to_string())?;
+    stream.write_all(&frame).map_err(|err| err.to_string())?;
+    stream.flush().map_err(|err| err.to_string())
+}
+
+fn codec_name(codec: Option<VideoCodec>) -> String {
+    codec
+        .map(|codec| format!("{codec:?}"))
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 /// Identity this client presents to a host.

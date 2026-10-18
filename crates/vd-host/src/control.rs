@@ -15,7 +15,7 @@ use std::thread;
 use log::{debug, info, warn};
 use vd_core::session::frame::{self, FrameDecoder};
 use vd_core::session::handshake::{Action, HostHandshake, State};
-use vd_core::{Capabilities, HostInfo, Session};
+use vd_core::{Capabilities, HostInfo, Session, SessionMessage};
 
 /// Read buffer for a single `recv`.
 const READ_BUFFER: usize = 4096;
@@ -100,8 +100,18 @@ fn serve(
 
         while let Some(message) = decoder.next_message()? {
             if handshake.state() == State::Established {
-                // Later steps: heartbeats and input events are handled here.
-                debug!("ignoring post-handshake message from {peer}: {message:?}");
+                match message {
+                    SessionMessage::Ping => {
+                        if let Err(err) = stream.write_all(&frame::encode(&SessionMessage::Pong)?) {
+                            if is_disconnect(&err) {
+                                return Ok(());
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                    // Later steps: input events are handled here.
+                    other => debug!("ignoring post-handshake message from {peer}: {other:?}"),
+                }
                 continue;
             }
 

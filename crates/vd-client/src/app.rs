@@ -20,7 +20,7 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 /// State of the control connection.
 enum Connection {
     Idle,
-    Connecting { host: String },
+    Connecting { host: String, note: Option<String> },
     Connected { session: Box<Session> },
     Failed { host: String, reason: String },
 }
@@ -107,18 +107,17 @@ impl VdClientApp {
     fn poll_connection(&mut self) {
         while let Ok(event) = self.events_rx.try_recv() {
             self.connection = match event {
+                ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
                 ConnectionEvent::Established(session) => Connection::Connected { session },
                 ConnectionEvent::Rejected { host, reason } => Connection::Failed {
                     host,
                     reason: reject_text(reason),
                 },
-                ConnectionEvent::Failed { host, error } => Connection::Failed {
+                // A failed attempt is not terminal: the worker retries. Keep the
+                // spinner going and surface the reason as a note.
+                ConnectionEvent::Failed { host, error } => Connection::Connecting {
                     host,
-                    reason: error,
-                },
-                ConnectionEvent::Closed { host } => Connection::Failed {
-                    host,
-                    reason: "connection closed".to_owned(),
+                    note: Some(error),
                 },
             };
         }
@@ -134,6 +133,7 @@ impl VdClientApp {
     fn start_connection(&mut self, addr: SocketAddr, host: HostInfo) {
         self.connection = Connection::Connecting {
             host: host.name.clone(),
+            note: None,
         };
         connection::connect(addr, host, self.events_tx.clone());
     }
@@ -218,11 +218,14 @@ fn connection_status(ui: &mut egui::Ui, connection: &Connection) {
         Connection::Idle => {
             ui.label("Not connected");
         }
-        Connection::Connecting { host } => {
+        Connection::Connecting { host, note } => {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(format!("Connecting to {host}…"));
             });
+            if let Some(note) = note {
+                ui.label(format!("last attempt: {note}"));
+            }
         }
         Connection::Connected { session } => {
             ui.colored_label(
