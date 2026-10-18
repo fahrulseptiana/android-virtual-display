@@ -236,6 +236,63 @@ fn to_rgba(
     }
 }
 
+/// Converts RGBA pixels to NV12 (BT.709, limited range), the format hardware
+/// H.264 encoders want.
+///
+/// Dimensions must be even: NV12 subsamples chroma 2×2.
+pub fn rgba_to_nv12(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CodecError> {
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        return Err(CodecError::SizeMismatch);
+    }
+    if rgba.len() < width as usize * height as usize * 4 {
+        return Err(CodecError::SizeMismatch);
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let mut nv12 = vec![0u8; width * height * 3 / 2];
+
+    // Luma plane.
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let (red, green, blue) = (
+                i32::from(rgba[i]),
+                i32::from(rgba[i + 1]),
+                i32::from(rgba[i + 2]),
+            );
+            nv12[y * width + x] = clamp_u8(((47 * red + 157 * green + 16 * blue + 128) >> 8) + 16);
+        }
+    }
+
+    // Interleaved chroma plane, one (U, V) pair per 2×2 block, averaged.
+    let chroma = width * height;
+    for y in (0..height).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let (mut red, mut green, mut blue) = (0i32, 0i32, 0i32);
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = ((y + dy) * width + (x + dx)) * 4;
+                    red += i32::from(rgba[i]);
+                    green += i32::from(rgba[i + 1]);
+                    blue += i32::from(rgba[i + 2]);
+                }
+            }
+            let (red, green, blue) = (red / 4, green / 4, blue / 4);
+
+            let index = chroma + ((y / 2) * (width / 2) + (x / 2)) * 2;
+            nv12[index] = clamp_u8(((-26 * red - 87 * green + 112 * blue + 128) >> 8) + 128);
+            nv12[index + 1] = clamp_u8(((112 * red - 102 * green - 10 * blue + 128) >> 8) + 128);
+        }
+    }
+
+    Ok(nv12)
+}
+
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +381,33 @@ mod tests {
             frame.data,
         );
         assert_eq!(decode_rgba(&video).unwrap().pixels, vec![30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn nv12_has_the_right_size_and_layout() {
+        let width = 4;
+        let height = 2;
+        let rgba = vec![255u8; width as usize * height as usize * 4];
+        let nv12 = rgba_to_nv12(width, height, &rgba).unwrap();
+        assert_eq!(nv12.len(), (width * height * 3 / 2) as usize);
+
+        // White maps to luma 235 in limited range.
+        for y in &nv12[..(width * height) as usize] {
+            assert_eq!(*y, 235);
+        }
+        // Neutral chroma is (within rounding of) 128.
+        for c in &nv12[(width * height) as usize..] {
+            assert!(
+                (i32::from(*c) - 128).abs() <= 1,
+                "chroma {c} should be ~128"
+            );
+        }
+    }
+
+    #[test]
+    fn nv12_rejects_odd_dimensions() {
+        assert!(rgba_to_nv12(3, 2, &[0; 24]).is_err());
+        assert!(rgba_to_nv12(2, 3, &[0; 24]).is_err());
     }
 
     #[test]
