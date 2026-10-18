@@ -1,5 +1,11 @@
 # Android Virtual Display
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Host: Windows](https://img.shields.io/badge/host-Windows-0078D6.svg)](#building-and-running)
+[![Client: Android 12+](https://img.shields.io/badge/client-Android%2012%2B-3DDC84.svg)](#building-and-running)
+[![Last commit](https://img.shields.io/github/last-commit/fahrulseptiana/android-virtual-display.svg)](https://github.com/fahrulseptiana/android-virtual-display/commits/main)
+
 Use an Android tablet as a wireless secondary display for a Windows PC.
 
 Two apps, one shared codebase:
@@ -197,9 +203,10 @@ Mirroring needs nothing beyond the host and the app. Extending needs Windows to
 believe in a monitor with no panel behind it, which is what an indirect display
 driver is for — and there is already a good one.
 
-The **Virtual Display Driver** is MIT licensed, signed with a certificate Windows
-accepts, and used by Sunshine, OBS and VR setups. This project neither ships nor
-requires its own driver; it captures a virtual monitor that exists.
+The **[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**
+is MIT licensed, signed with a certificate Windows accepts, and used by Sunshine,
+OBS and VR setups. This project neither ships nor requires its own driver; it
+captures a virtual monitor that exists.
 
 ```powershell
 # Elevated, once. Downloads the driver, trusts its certificate, installs it and
@@ -342,8 +349,9 @@ The project deliberately leans on a few principles:
 - [x] Mouse cursor mirrored from the host
 - [x] Client UI: searching ripple → host list → full-screen, back to return
 - [x] Extend as well as mirror: the tablet chooses the display, and the host
-      switches live ([why a virtual display](PLAN.md))
-- [x] The tablet as a real second monitor, via a signed virtual display driver
+      switches live ([why a virtual display](PLAN.md#phase-7--a-real-second-monitor-extend))
+- [x] The tablet as a real second monitor, via a signed
+      [virtual display driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
 - [x] Overlay on the stream — mirror/extend and latency — hidden by a tap
 - [ ] Touch / keyboard input forwarding
 - [x] Trust-on-first-use host identity (authenticated pairing, silent reconnects)
