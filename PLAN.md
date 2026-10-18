@@ -65,6 +65,47 @@ with input flowing back to the PC, at a latency that feels native.
 Everything that is not OS-specific lives in `vd-core` and is compiled into both
 apps. Capture/encode lives only in the host; decode/UI lives only in the client.
 
+### GPU acceleration strategy (decision record)
+
+The heavy lifting is done by hardware **video codecs**, not by Vulkan.
+Vulkan is already present — the client composites with `wgpu`, whose Android
+backend is Vulkan — but no amount of it helps the actual bottleneck, which is
+the codec.
+
+```
+host:  DXGI (D3D11 texture)
+         └─▶ D3D11 Video Processor      scale 4K→target, BGRA→NV12, on the GPU
+               └─▶ Media Foundation MFT hardware H.264 (D3D11-aware, zero-copy)
+                     └─▶ encrypt ─▶ TCP
+
+client: TCP ─▶ decrypt ─▶ MediaCodec hardware H.264 ─▶ Surface
+                             └─▶ composited by wgpu (Vulkan) under the egui UI
+```
+
+What this removes, measured on a 3840×2160 desktop streamed at 1280×720:
+
+| Removed | Cost today | Replaced by |
+|---------|-----------|-------------|
+| GPU→CPU readback of the 4K frame | 33 MB/frame | stays on the GPU |
+| CPU box downscale | 25 ms | D3D11 video processor (~1 ms) |
+| CPU JPEG encode | 16 ms | hardware H.264 encode (~5 ms) |
+| CPU JPEG decode on the tablet | ~400 ms | MediaCodec (~2 ms) |
+| RGBA texture upload on the client | 3.7 MB/frame | not needed (decode to a Surface) |
+
+Why not Vulkan Video (`VK_KHR_video_encode_queue` / `_decode_queue`)? It is a
+real API, but hardware *encode* support on Windows drivers is immature, and on
+Android the first-class, guaranteed path is MediaCodec. Capture is inherently
+platform-specific anyway (DXGI here, PipeWire/DRM elsewhere), so a single
+portable GPU API buys little. Revisit if the driver landscape changes.
+
+One refinement is worth doing later: import MediaCodec's decoded
+`AHardwareBuffer` into `wgpu` as an external texture
+(`VK_ANDROID_external_memory_android_hardware_buffer`), so the video and the UI
+share one renderer instead of being composited as two layers.
+
+**Fallback:** the JPEG/raw path stays behind capability negotiation
+(`VideoCodec`), so an old or exotic peer still works.
+
 ---
 
 ## 3. Phases
@@ -134,12 +175,13 @@ active man-in-the-middle who re-runs the exchange on both sides. See
       Measured from a 3840×2160 desktop streamed at 1280×720 in release:
       **8.9–13 fps** (box downscale 25 ms, JPEG encode 16 ms per frame). On the
       tablet the pure-Rust JPEG *decoder* is the client-side limit (~2 fps).
-      Both ends need hardware H.264.
-- [ ] **Primary:** hardware H.264 via Media Foundation MFTs (AMD AMF / NVENC /
-      QuickSync), zero-copy from the capture texture.
-- [ ] **Fallback:** software x264 at reduced quality.
+- [ ] **Primary:** hardware H.264 through Media Foundation. The image is scaled
+      and converted to NV12 by the **D3D11 Video Processor**, then fed to a
+      hardware encoder MFT as a D3D11 texture (zero-copy). See the
+      [GPU acceleration strategy](#gpu-acceleration-strategy-decision-record).
 - [ ] Rate control for Wi-Fi: variable bitrate with a capped bitrate, keyframe
       on demand (first frame, loss recovery, resolution change).
+- [ ] Keep the JPEG/raw path as the capability-negotiated fallback.
 - [ ] Optional, later: HEVC and AV1 (AV1 only where hardware decode exists).
 
 **Decision:** start with H.264 — it has the widest hardware decode support on
@@ -163,13 +205,16 @@ negotiation from Phase 2.
 
 - [x] JPEG decode on the client and display through an egui texture, off the UI
       thread, with a one-slot mailbox so the display never lags the stream.
-- [ ] `MediaCodec` in async mode, decode to an `AImageReader`/`Surface`.
-- [ ] Render the video surface directly (SurfaceView/texture) under a thin egui
-      overlay for connection status.
+- [ ] **Primary:** `MediaCodec` in async mode decoding H.264 to a `Surface`, so
+      frames never touch the CPU. Requires plumbing a surface down to the Rust
+      side (e.g. `SurfaceView`/`ANativeWindow`).
+- [ ] Keep the JPEG/raw path for peers that cannot do H.264.
 - [ ] Adaptive: drop late frames rather than queueing; track decode/render
       timings for the latency budget.
 - [ ] Handle rotation, notch/cutout, and backgrounding (pause capture when the
       app is not visible).
+- [ ] Later: import the decoded `AHardwareBuffer` into `wgpu` so the video and
+      the UI share one renderer.
 
 ### Phase 7 — Input forwarding
 

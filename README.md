@@ -226,7 +226,8 @@ The project deliberately leans on a few principles:
 - [x] Video pipeline end to end: frame protocol, capture abstraction, encoded
       frames over the encrypted channel, client render
 - [x] Real desktop capture (DXGI Desktop Duplication) with stream downscaling
-- [ ] Hardware H.264 encode (Media Foundation) and decode (MediaCodec)
+- [ ] Hardware H.264: Media Foundation encode on the host, MediaCodec decode on
+      the tablet ([strategy](PLAN.md#gpu-acceleration-strategy-decision-record))
 - [ ] Trust-on-first-use host identity (authenticated pairing)
 - [ ] Touch / keyboard input forwarding
 
