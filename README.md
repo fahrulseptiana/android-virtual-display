@@ -12,10 +12,12 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: discovery only.** The virtual display / video transport is *not*
-> implemented yet. Today the client binds a UDP socket, finds hosts on the local
-> network and shows them in a list. That is the whole feature set — and it works
-> on a real Android device talking to a real Windows host over Wi-Fi.
+> **Status: discovery + control channel.** The client finds hosts on the LAN,
+> opens an encrypted control session with one, and confirms a pairing PIN. The
+> virtual-display **video transport is not implemented yet** — the control
+> channel is the foundation it will run on. Discovery, pairing and heartbeats
+> are verified on a real Android device talking to a real Windows host over
+> Wi-Fi.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -27,14 +29,20 @@ Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 .
 ├── Cargo.toml                     # cargo workspace
 ├── crates
-│   ├── vd-core                    # shared: protocol + discovery (no I/O deps)
+│   ├── vd-core                    # shared logic, platform agnostic
 │   │   └── src
 │   │       ├── protocol.rs        # HostInfo, DiscoveryMessage, Envelope (JSON over UDP)
 │   │       ├── net.rs             # PacketIo trait + UdpPacketIo implementation
-│   │       └── discovery
-│   │           ├── browser.rs     # client side: probe + collect announces
-│   │           └── responder.rs   # host side: answer probes + beacon
-│   ├── vd-host                    # Windows host binary
+│   │       ├── discovery          # browser.rs (client) + responder.rs (host)
+│   │       └── session            # control channel
+│   │           ├── mod.rs         # SessionMessage + capability types
+│   │           ├── handshake.rs   # Client/HostHandshake state machines
+│   │           ├── pairing.rs     # X25519 exchange, PIN, key confirmation
+│   │           ├── cipher.rs      # ChaCha20-Poly1305 session cipher
+│   │           ├── channel.rs     # plaintext/encrypted message transport
+│   │           ├── frame.rs       # length-prefixed framing
+│   │           └── heartbeat.rs   # liveness tracking
+│   ├── vd-host                    # Windows host: discovery + control server
 │   └── vd-client                  # Android cdylib + desktop harness
 └── android                        # Gradle project that packages the APK
     └── app/src/main
@@ -71,8 +79,45 @@ Discovery is a small, symmetric UDP protocol on port **47700**:
 Both sides are **poll driven** (`poll(now)`), which lets the same state machines
 run in a CLI loop on Windows and in an egui repaint loop on Android.
 
-Reserved for later: TCP port **47701** (`HostInfo::control_port`) will carry the
-display session handshake and stream.
+Reserved for later: TCP port **47701** (`HostInfo::control_port`) carries the
+control session and, eventually, the display stream.
+
+---
+
+## How the control channel works
+
+Once a host is discovered the client opens a TCP connection on its
+`control_port` and runs a short, encrypted handshake:
+
+```
+  client                                          host
+    │  ── Hello { protocol, client, caps,          │
+    │            client_public } ─────────────────▶│  derives keys, auto-approves
+    │  ◀── Welcome { protocol, host, caps,          │
+    │               host_public, salt, tag } ───────│  (last plaintext message)
+    │  derives the same key + PIN, verifies tag     │
+    │  user confirms the PIN  ──▶  Pair confirmed   │
+    │  ◀──────── encrypted Ping / Pong ────────────▶│
+```
+
+* Both sides perform an **ephemeral X25519** exchange and derive a session key
+  and a six-digit PIN with HKDF-SHA256.
+* The **client** shows the PIN and waits for the user; the **host
+auto-approves**. The host's `Welcome` carries an HMAC key-confirmation tag.
+* After the `Welcome` every message is sealed with **ChaCha20-Poly1305**, using
+  a separate key and nonce counter per direction.
+* `Ping`/`Pong` keep the session alive; a silent peer is dropped and the client
+  reconnects with exponential backoff.
+
+The messages live in [`vd_core::session`](crates/vd-core/src/session) and the
+state machines are transport-agnostic (and unit tested without sockets).
+
+### Security note
+
+The channel is encrypted, but pairing is not yet authenticated end-to-end: the
+host does not display the PIN, so an active man-in-the-middle is not detected.
+Trust-on-first-use host identity is the next hardening step — see
+[PLAN.md](PLAN.md#security).
 
 ---
 
@@ -157,7 +202,9 @@ The project deliberately leans on a few principles:
 
 - [x] Host discovery over Wi-Fi (probe / announce / bye)
 - [x] Windows host + Android client from one Rust codebase
-- [ ] Control connection on TCP 47701 (session handshake, capability exchange)
+- [x] Control channel on TCP 47701: handshake, capability exchange, PIN pairing,
+      encryption, heartbeats and automatic reconnect
+- [ ] Trust-on-first-use host identity (authenticated pairing)
 - [ ] Desktop capture on Windows (DXGI Desktop Duplication)
 - [ ] Hardware video encode (Media Foundation / NVENC)
 - [ ] Android decode (MediaCodec) and render

@@ -87,21 +87,29 @@ apps. Capture/encode lives only in the host; decode/UI lives only in the client.
 **Exit criteria met:** the client lists every host on the LAN within ~2 s, and
 drops one within ~10 s of it going away.
 
-### Phase 2 — Control channel
+### Phase 2 — Control channel ✅ done
 
-Establish a reliable TCP session on `HostInfo::control_port` (47701) before any
-video is sent.
+A reliable, encrypted TCP session on `HostInfo::control_port` (47701).
 
-- [ ] Session handshake: protocol negotiation, capability exchange
-      (codecs, max resolution, HDR, input modes).
-- [ ] Pairing: 6-digit PIN shown on the host, entered on the client; derive a
-      shared secret and encrypt the session (Noise `NNpsk0` or TLS 1.3).
-- [ ] Keep-alive + heartbeats; clean teardown; reconnect with exponential
-      backoff.
-- [ ] `vd-core::session` — handshake state machine, transport-agnostic and unit
-      tested with `MockIo`.
+- [x] Session handshake: protocol negotiation and capability exchange
+      (codecs, max resolution/fps, input modes).
+- [x] Pairing: ephemeral X25519 exchange derives a session key and a six-digit
+      PIN. The **client** shows the PIN and asks its user to confirm; the
+      **host auto-approves** and establishes immediately.
+- [x] Key confirmation: the host's `Welcome` carries an HMAC tag over the
+      handshake transcript, so the client can detect a broken exchange.
+- [x] Encryption: ChaCha20-Poly1305 with per-direction keys and monotonic
+      nonces; the `Welcome` is the last plaintext message.
+- [x] Heartbeats (`Ping`/`Pong`) and automatic reconnect with exponential
+      backoff (1 s … 30 s).
+- [x] `vd-core::session` — handshake, pairing, framing and cipher, all
+      transport-agnostic and unit tested.
 
-**Why first:** it is small, testable, and everything later hangs off it.
+**Known limitation:** the host does not display the PIN, so the PIN is a
+client-side approval gate rather than an out-of-band comparison. It protects
+against passive eavesdroppers (the channel is encrypted) but not against an
+active man-in-the-middle who re-runs the exchange on both sides. See
+[Security](#security) for the planned fix (trust-on-first-use host key).
 
 ### Phase 3 — Desktop capture (Windows)
 
@@ -172,13 +180,18 @@ negotiation from Phase 2.
 
 ### Security
 
-A remote display is remote control. From Phase 2 onward:
+A remote display is remote control. The control channel is encrypted, but the
+current pairing is **not yet authenticated end-to-end** — see the known
+limitation in Phase 2. Plan:
 
-- Never stream to an unpaired client.
-- Encrypt the session; authenticate the host to the client **and** the client to
-  the host.
-- The PIN is a one-time pairing secret, not the long-term key.
-- Document the threat model in `SECURITY.md` (LAN attacker, rogue host).
+- [x] Encrypt the session (ChaCha20-Poly1305, per-direction keys).
+- [x] Host proves key knowledge to the client (key-confirmation tag).
+- [ ] Trust on first use: the host gets a persistent identity key; the client
+      stores it after the first pairing and refuses to talk to a different one
+      without warning. This is what turns the PIN into a real check.
+- [ ] Bind the session key to that identity so a MITM cannot re-key silently.
+
+Document the threat model (LAN attacker, rogue host) in `SECURITY.md`.
 
 ### Performance budgets (1080p60)
 
@@ -216,7 +229,7 @@ Instrumentation ships from Phase 3 onward so regressions are visible.
 | Milestone | Contents | Phases |
 |-----------|----------|--------|
 | **M1 — Discoverable** ✅ | Hosts show up on the device | 0–1 |
-| **M2 — Connected** | Encrypted, negotiated session; no video yet | 2 |
+| **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
 | **M3 — First frame** | Capture → encode → TCP → decode → screen | 3–6 (minimal) |
 | **M4 — Usable** | 1080p30+, < 100 ms, stable | 5–6 |
 | **M5 — Interactive** | Input forwarding | 7 |
