@@ -12,12 +12,11 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: H.264 end to end.** The client discovers a host, pairs, opens an
-> encrypted session and displays the live Windows desktop (DXGI capture →
-> Media Foundation H.264 → MediaCodec on the tablet). Measured at ~8 fps at
-> 720p, so "usable" is not there yet: encoding still runs on the host CPU
-> because the AMD hardware encoder will not configure on this driver, and the
-> client converts YUV to RGBA on the CPU. See PLAN.md for both.
+> **Status: H.264 end to end, hardware on both ends.** The client discovers a
+> host, pairs, opens an encrypted session and displays the live Windows desktop:
+> DXGI capture → AMD hardware H.264 encode → MediaCodec hardware decode. Measured
+> at ~12 fps at 720p; the remaining cost is the CPU readback and scale on the
+> host and the YUV→RGBA conversion on the tablet. See PLAN.md.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -231,8 +230,9 @@ The project deliberately leans on a few principles:
 - [x] Real desktop capture (DXGI Desktop Duplication) with stream downscaling
 - [x] H.264 end to end: Media Foundation encode on the host, MediaCodec decode on
       the tablet ([strategy](PLAN.md#gpu-acceleration-strategy-decision-record))
-- [ ] Hardware (GPU) H.264 encode — blocked by the AMD driver's async MFT unlock
-- [ ] Zero-copy client decode (Surface / AHardwareBuffer)
+- [x] Hardware (GPU) H.264 encode (AMD hardware MFT)
+- [ ] Zero-copy: D3D11 video processor on the host, Surface/AHardwareBuffer on
+      the client
 - [ ] Trust-on-first-use host identity (authenticated pairing)
 - [ ] Touch / keyboard input forwarding
 
