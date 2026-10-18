@@ -14,6 +14,7 @@ use vd_core::HostId;
 
 const APP_DIR: &str = "id.fahrul.vd";
 const ID_FILE: &str = "host-id";
+const KEY_FILE: &str = "host-key";
 
 /// Loads the persisted host id, creating one on first run.
 pub fn load_or_create_host_id() -> HostId {
@@ -44,6 +45,43 @@ pub fn load_or_create_host_id() -> HostId {
     HostId::new(id)
 }
 
+/// Loads the host's long-lived identity key, creating one on first run.
+///
+/// This key is what clients remember: keeping it stable across restarts is what
+/// lets a client reconnect without asking for the PIN again.
+pub fn load_or_create_identity_key() -> vd_core::Result<[u8; 32]> {
+    let Some(path) = key_path() else {
+        warn!("no writable data directory; this host's identity will change on restart");
+        return vd_core::session::pairing::generate_secret();
+    };
+
+    if let Ok(text) = fs::read_to_string(&path) {
+        match vd_core::session::pairing::key_from_hex(&text) {
+            Some(key) => {
+                debug!("loaded the host identity key from {}", path.display());
+                return Ok(key);
+            }
+            None => warn!(
+                "{} is unreadable; generating a new identity",
+                path.display()
+            ),
+        }
+    }
+
+    let key = vd_core::session::pairing::generate_secret()?;
+    if let Some(dir) = path.parent() {
+        if let Err(err) = fs::create_dir_all(dir) {
+            warn!("could not create {}: {err}", dir.display());
+            return Ok(key);
+        }
+    }
+    match fs::write(&path, vd_core::session::pairing::key_to_hex(&key)) {
+        Ok(()) => debug!("persisted the host identity key to {}", path.display()),
+        Err(err) => warn!("could not persist the host identity key: {err}"),
+    }
+    Ok(key)
+}
+
 /// Best-effort human readable name for this machine.
 ///
 /// `VD_HOST_NAME` overrides the detected value.
@@ -62,6 +100,10 @@ pub fn host_name() -> String {
 
 fn id_file_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join(ID_FILE))
+}
+
+fn key_path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(KEY_FILE))
 }
 
 fn data_dir() -> Option<PathBuf> {

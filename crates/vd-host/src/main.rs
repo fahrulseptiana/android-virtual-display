@@ -75,7 +75,13 @@ fn main() -> vd_core::Result<()> {
     let capabilities = host_capabilities(encoder.is_some());
     video::spawn_capture(broadcaster.clone(), source, fps, (width, height), encoder);
 
-    let control = control::ControlServer::bind(host.clone(), capabilities, broadcaster.clone())?;
+    let identity_key = identity::load_or_create_identity_key()?;
+    let control = control::ControlServer::bind(
+        host.clone(),
+        capabilities,
+        broadcaster.clone(),
+        identity_key,
+    )?;
 
     info!(
         "host \"{}\" ({}) ready — id {}, discovery udp/{}",

@@ -40,6 +40,8 @@ pub struct ControlServer {
     host: HostInfo,
     capabilities: Capabilities,
     video: Arc<Broadcaster>,
+    /// Long-lived identity key, published in `Welcome` and used to authenticate.
+    identity_secret: [u8; 32],
 }
 
 impl ControlServer {
@@ -48,6 +50,7 @@ impl ControlServer {
         host: HostInfo,
         capabilities: Capabilities,
         video: Arc<Broadcaster>,
+        identity_secret: [u8; 32],
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", host.control_port))?;
         // Non-blocking so the host's discovery loop is never held up.
@@ -57,6 +60,7 @@ impl ControlServer {
             host,
             capabilities,
             video,
+            identity_secret,
         })
     }
 
@@ -73,8 +77,11 @@ impl ControlServer {
                     let host = self.host.clone();
                     let capabilities = self.capabilities.clone();
                     let video = self.video.clone();
+                    let identity_secret = self.identity_secret;
                     thread::spawn(move || {
-                        if let Err(err) = serve(stream, peer, host, capabilities, video) {
+                        if let Err(err) =
+                            serve(stream, peer, host, capabilities, video, identity_secret)
+                        {
                             warn!("control connection from {peer} ended with error: {err}");
                         }
                     });
@@ -94,6 +101,7 @@ fn serve(
     host: HostInfo,
     capabilities: Capabilities,
     video: Arc<Broadcaster>,
+    identity_secret: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so the worker explicitly asks for blocking reads.
@@ -101,7 +109,7 @@ fn serve(
     stream.set_nodelay(true)?;
     debug!("control connection from {peer}");
 
-    let mut handshake = HostHandshake::new(host, capabilities);
+    let mut handshake = HostHandshake::new(host, capabilities, identity_secret);
     let mut decoder = FrameDecoder::new();
     let mut channel = Channel::plaintext();
     let mut buffer = [0u8; READ_BUFFER];
@@ -177,7 +185,7 @@ fn serve(
                 Err(err) => return Err(err.into()),
             };
             let message = match channel.decode(&payload) {
-                Ok(Frame::Control(message)) => message,
+                Ok(Frame::Control(message)) => *message,
                 // Clients never send video; ignore it rather than failing.
                 Ok(Frame::Video(_)) => continue,
                 Err(err) => {
