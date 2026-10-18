@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use log::info;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
-use vd_core::{HostId, HostInfo, RejectReason, Session};
+use vd_core::{DisplayInfo, DisplayKind, HostId, HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
 use crate::frames::FrameQueue;
@@ -97,6 +97,9 @@ pub struct VdClientApp {
     retry_target: Option<HostId>,
     /// How long frames are taking, measured by the connection and shown here.
     latency: Latency,
+    /// What the host says it could show, and which of those it is showing.
+    displays: Vec<DisplayInfo>,
+    current_display: u32,
     /// When to write the next latency summary to the log.
     next_latency_report: Instant,
     /// When the drawn-frame count was last reset, for the rate in that summary.
@@ -120,6 +123,8 @@ impl VdClientApp {
             trust_path,
             retry_target: None,
             latency: Latency::new(),
+            displays: Vec::new(),
+            current_display: 0,
             next_latency_report: Instant::now() + LATENCY_REPORT_INTERVAL,
             last_rate_report: Instant::now(),
             last_dropped: 0,
@@ -208,6 +213,14 @@ impl VdClientApp {
                     self.view = View::Stream;
                     Connection::Connected { session }
                 }
+                ConnectionEvent::Displays { current, outputs } => {
+                    for output in &outputs {
+                        log::info!("host display {}: {}", output.index, output.summary());
+                    }
+                    self.current_display = current;
+                    self.displays = outputs;
+                    continue;
+                }
                 ConnectionEvent::Rejected { host, reason } => Connection::Failed {
                     host,
                     reason: reject_text(reason),
@@ -254,6 +267,63 @@ impl VdClientApp {
         }
         self.latency.record_render(started.elapsed());
         self.frames_seen += 1;
+    }
+
+    /// Offers mirror or extend, when the host has a screen worth extending onto.
+    ///
+    /// Mirror means the screen the host is already using, extend means the one a
+    /// virtual display driver added, and which is which is the host's answer
+    /// rather than a guess here. Offered over the stream rather than before it
+    /// because the host's list only arrives with the session.
+    fn show_display_choice(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        if !matches!(self.connection, Connection::Connected { .. }) || self.displays.is_empty() {
+            return;
+        }
+
+        let mirror = self.displays.iter().find(|d| d.primary).map(|d| d.index);
+        let extend = self
+            .displays
+            .iter()
+            .find(|d| d.kind == DisplayKind::Virtual)
+            .map(|d| d.index);
+        let current = self.current_display;
+
+        let mut chosen = None;
+        egui::Area::new(egui::Id::unique("display-choice"))
+            .fixed_pos(rect.right_top() + egui::vec2(-232.0, 10.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(index) = mirror {
+                            let active = current == index;
+                            if ui.selectable_label(active, "Mirror").clicked() && !active {
+                                chosen = Some(index);
+                            }
+                        }
+                        match extend {
+                            Some(index) => {
+                                let active = current == index;
+                                if ui.selectable_label(active, "Extend").clicked() && !active {
+                                    chosen = Some(index);
+                                }
+                            }
+                            None => {
+                                ui.add_enabled(false, egui::Button::new("Extend"))
+                                    .on_disabled_hover_text(
+                                        "This host has no virtual display to extend onto",
+                                    );
+                            }
+                        }
+                    });
+                });
+            });
+
+        if let Some(index) = chosen {
+            if let Some(handle) = self.handle.as_ref() {
+                info!("asking the host for display {index}");
+                handle.select_display(index);
+            }
+        }
     }
 
     /// Writes the timings measured so far to the log, every few seconds.
@@ -312,6 +382,8 @@ impl VdClientApp {
         // fails, and it exits rather than retrying behind the user's back.
         self.events_rx = None;
         self.retry_target = None;
+        self.displays.clear();
+        self.current_display = 0;
         self.connection = Connection::Idle;
         self.view = View::Browser;
         self.frames.clear();
@@ -592,6 +664,8 @@ impl VdClientApp {
                 );
             }
         }
+
+        self.show_display_choice(ui, rect);
 
         // Anything but a live session is veiled, so a dropped connection can
         // never be mistaken for a frozen desktop.

@@ -11,7 +11,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,8 +26,8 @@ use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, ClientHandshake};
 use vd_core::video::VideoFrame;
 use vd_core::{
-    Capabilities, ClientInfo, FrameFormat, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities,
-    Platform, RejectReason, Session, SessionMessage, VideoCodec,
+    Capabilities, ClientInfo, DisplayInfo, FrameFormat, Heartbeat, HeartbeatAction, HostInfo,
+    InputCapabilities, Platform, RejectReason, Session, SessionMessage, VideoCodec,
 };
 
 use crate::frames::{DecodedFrame, FrameQueue};
@@ -94,6 +94,11 @@ pub enum ConnectionEvent {
     },
     /// Handshake and pairing succeeded.
     Established(Box<Session>),
+    /// The host listed what it could show, and which of those it is showing.
+    Displays {
+        current: u32,
+        outputs: Vec<DisplayInfo>,
+    },
     /// An attempt failed; the worker will retry after a backoff.
     Failed { host: String, error: String },
     /// The host refused the session — terminal, the worker stops.
@@ -145,7 +150,16 @@ struct WorkerControl {
     cancelled: Arc<AtomicBool>,
     /// Skip the rest of the current backoff.
     retry: Arc<AtomicBool>,
+    /// A display the UI wants instead of the current one.
+    ///
+    /// A plain atomic rather than a channel because only the latest request
+    /// matters: a user tapping "extend" twice is not asking for two switches.
+    /// `NO_DISPLAY` means nothing is pending.
+    wanted_display: Arc<AtomicU32>,
 }
+
+/// The value of `wanted_display` when the user has not asked for anything.
+const NO_DISPLAY: u32 = u32::MAX;
 
 /// The UI's end of a connection: answers pairing requests and can stop the
 /// worker.
@@ -154,6 +168,7 @@ pub struct ConnectionHandle {
     decisions: Sender<bool>,
     cancelled: Arc<AtomicBool>,
     retry: Arc<AtomicBool>,
+    wanted_display: Arc<AtomicU32>,
 }
 
 impl ConnectionHandle {
@@ -174,6 +189,15 @@ impl ConnectionHandle {
     pub fn retry_now(&self) {
         self.retry.store(true, Ordering::Relaxed);
     }
+
+    /// Asks the host to capture a different display.
+    ///
+    /// Takes effect on the worker's next turn round the loop, and the host
+    /// answers with a fresh display list, so the UI learns what happened rather
+    /// than assuming.
+    pub fn select_display(&self, index: u32) {
+        self.wanted_display.store(index, Ordering::Relaxed);
+    }
 }
 
 /// Spawns a thread that keeps a session to `host` alive, reconnecting as needed.
@@ -185,16 +209,19 @@ pub fn connect(
 ) -> ConnectionHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let retry = Arc::new(AtomicBool::new(false));
+    let wanted_display = Arc::new(AtomicU32::new(NO_DISPLAY));
     let (decisions_tx, decisions_rx) = channel();
     let control = WorkerControl {
         cancelled: cancelled.clone(),
         retry: retry.clone(),
+        wanted_display: wanted_display.clone(),
     };
     thread::spawn(move || supervise(addr, host, sinks, decisions_rx, control, trust_path));
     ConnectionHandle {
         decisions: decisions_tx,
         cancelled,
         retry,
+        wanted_display,
     }
 }
 
@@ -457,6 +484,17 @@ fn attempt(
             None => {}
         }
 
+        // The user may have asked for a different display while the host was
+        // busy sending frames.
+        let wanted = control.wanted_display.swap(NO_DISPLAY, Ordering::Relaxed);
+        if wanted != NO_DISPLAY {
+            let message = SessionMessage::SelectDisplay { index: wanted };
+            if let Err(err) = write_message(&mut stream, &mut channel, &message) {
+                return Attempt::Disconnected(format!("could not select a display: {err}"));
+            }
+            info!("asked the host for display {wanted}");
+        }
+
         // A paint means a surface; no paint for a while means the app has gone
         // to the background, and there is nothing to be gained by receiving
         // video for a screen nobody is looking at.
@@ -581,6 +619,12 @@ fn handle_stream(sinks: &Sinks, worker: &DecoderWorker, frame: Frame) {
             if format == FrameFormat::H264 {
                 worker.configure(width, height, extradata);
             }
+        }
+        Frame::Control(message) if matches!(*message, SessionMessage::Displays { .. }) => {
+            let SessionMessage::Displays { current, outputs } = *message else {
+                unreachable!("guarded above")
+            };
+            sinks.send(ConnectionEvent::Displays { current, outputs });
         }
         // Pongs and anything else need no action.
         Frame::Control(_) => {}
