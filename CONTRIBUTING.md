@@ -28,11 +28,12 @@ cargo install cargo-ndk
 ### Build and run
 
 ```bash
-# Host (Windows)
-cargo run -p vd-host
+# Host (Windows) — release: a debug build is about ten times slower in the
+# pixel paths, which turns 30 fps into about 3.
+cargo run -p vd-host --release
 
 # Client — desktop harness (fastest way to iterate on the UI)
-cargo run -p vd-client
+cargo run -p vd-client --release
 cargo run -p vd-client --example discover   # headless, prints hosts
 
 # Client — Android
@@ -41,6 +42,20 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n id.fahrul.vd/android.app.NativeActivity
 adb logcat -s vd-client
 ```
+
+### Testing without a device
+
+The host and the desktop client run happily against each other on one machine,
+which is far quicker than deploying to a tablet. The desktop client cannot decode
+H.264 (that is Android-only), but it exercises discovery, the handshake and the
+control channel.
+
+Two host diagnostics save time:
+
+| Variable | What it does |
+|---|---|
+| `VD_LIST_OUTPUTS=1` | lists every display output and whether it can be duplicated, then exits |
+| `VD_ENCODER_CHECK=1` | encodes 30 synthetic frames and reports, so the hardware encoder can be checked without a client |
 
 Before opening a pull request, run:
 
@@ -55,7 +70,8 @@ cargo test --workspace
 ## Project layout
 
 ```
-crates/vd-core     shared, platform-agnostic: protocol + discovery + (soon) session
+crates/vd-core     shared, platform-agnostic: protocol, discovery, session,
+                   latency, display descriptions
 crates/vd-host     Windows host binary
 crates/vd-client   Android cdylib + desktop harness
 android/           Gradle project that packages id.fahrul.vd
@@ -74,18 +90,25 @@ These exist to keep the shared core genuinely shared. Please respect them:
 1. **`vd-core` must stay platform-agnostic and dependency-light.** No Windows
    APIs, no Android APIs, no JNI, no threads, no filesystem. It is compiled for
    both targets and for tests.
-2. **Talk to abstractions, not sockets.** Discovery and (soon) the session talk
-   to the `PacketIo` trait. If you need a new capability, extend the trait rather
-   than reaching for `UdpSocket`/`TcpStream` directly in the algorithm.
+2. **Talk to abstractions, not sockets.** Discovery talks to the `PacketIo`
+   trait, and the session's framing works on plain byte slices, so it can be
+   driven by any stream. Algorithms should not reach for
+   `UdpSocket`/`TcpStream` themselves.
 3. **Keep it testable.** New logic in `vd-core` should be unit-testable with
    `MockIo` and no network. A test that needs a real socket belongs in an
    integration test.
-4. **YAGNI.** Don't build the next phase early. No video code paths until the
-   control channel exists; no config file until someone needs one.
+4. **YAGNI.** Don't build the next phase early. No config file until someone
+   needs one, and no abstraction until there is a second implementation of it —
+   the transport was deliberately left as TCP rather than put behind a trait
+   because there was only ever one thing to put there.
 5. **One responsibility per type.** `Envelope` encodes, `Browser` tracks the
    client's view, `Responder` announces. Don't merge them.
 6. **No panics in library code.** Return `Result`; the app may log and recover.
    `unwrap()` in `vd-core` is a review blocker (tests excepted).
+7. **The platform seam is narrow.** Windows-specific capture lives in `vd-host`,
+   behind the `FrameSource` trait; nothing downstream knows what a display is.
+   Keep new platform code on that side of the seam, and keep the seam honest —
+   `vd-client` has exactly one Android-only module for the same reason.
 
 ---
 
@@ -118,7 +141,8 @@ Allowed types:
 | `revert` | reverting a previous commit |
 
 Scopes (optional, but preferred): `core`, `host`, `client`, `android`, `deps`,
-`docs`.
+`docs`, `plan`, `sandbox`. A scope names the area rather than the file:
+`docs(plan)` for the roadmap, `feat(sandbox)` for the test tooling.
 
 Rules:
 

@@ -493,8 +493,10 @@ driver but loading one:
 
 ### Security
 
-A remote display is remote control. The control channel is encrypted, but the
-current pairing is **not yet authenticated end-to-end** — see the known
+A remote display is remote control. The channel is encrypted and the host proves
+its identity, but the **first** pairing is unauthenticated in the strict sense —
+the host does not display the PIN, so there is nothing to compare out of band.
+Every pairing after that is checked against the remembered key. See the known
 limitation in Phase 2. Plan:
 
 - [x] Encrypt the session (ChaCha20-Poly1305, per-direction keys).
