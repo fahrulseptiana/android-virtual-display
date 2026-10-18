@@ -8,6 +8,7 @@
 //!   logic can be iterated on without a device.
 
 pub mod app;
+pub mod connection;
 pub mod logging;
 
 pub const APP_NAME: &str = "VD Client";
