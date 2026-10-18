@@ -154,8 +154,8 @@ A reliable, encrypted TCP session on `HostInfo::control_port` (47701).
       handshake transcript, so the client can detect a broken exchange.
 - [x] Encryption: ChaCha20-Poly1305 with per-direction keys and monotonic
       nonces; the `Welcome` is the last plaintext message.
-- [x] Heartbeats (`Ping`/`Pong`) and automatic reconnect with exponential
-      backoff (1 s … 30 s).
+- [x] Heartbeats (`Ping`/`Pong`) and automatic reconnect: an immediate retry
+      after a drop, then a short backoff (0.5 s … 5 s).
 - [x] `vd-core::session` — handshake, pairing, framing and cipher, all
       transport-agnostic and unit tested.
 

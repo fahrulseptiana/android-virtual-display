@@ -65,11 +65,16 @@ type Decoder = FallbackDecoder;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `read` blocks before we get a chance to poll the heartbeat.
-const READ_POLL: Duration = Duration::from_millis(500);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const READ_POLL: Duration = Duration::from_millis(250);
+/// Frequent enough that a host which has gone away is noticed in about this
+/// long, rather than only when a write finally fails.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A LAN connection either succeeds at once or is refused at once, so the
+/// backoff exists only to avoid spinning while a host is down — it does not
+/// need to grow into tens of seconds.
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const READ_BUFFER: usize = 4096;
 
 /// What the connection thread reports back to the UI.
@@ -177,17 +182,26 @@ fn supervise(
             addr, &host.name, &events, &decisions, &frames, &cancelled, &mut trust,
         ) {
             Attempt::Disconnected(error) => {
-                // We had a session, so retry promptly.
+                // We had a session, so try again immediately: the usual reason
+                // for losing one is that the host restarted, and it is often
+                // already listening again by the time we get here.
                 warn!("session with {} ended: {error}", host.name);
-                delay = INITIAL_RECONNECT_DELAY;
+                delay = Duration::ZERO;
                 previous_error = Some(error);
             }
             Attempt::Failed(error) => {
+                // A refused connection means the host really is down, so wait —
+                // but starting from a short delay, and never for long.
+                let next = if delay.is_zero() {
+                    INITIAL_RECONNECT_DELAY
+                } else {
+                    (delay * 2).min(MAX_RECONNECT_DELAY)
+                };
                 warn!(
-                    "connection to {} failed: {error}; retrying in {delay:?}",
+                    "connection to {} failed: {error}; retrying in {next:?}",
                     host.name
                 );
-                delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+                delay = next;
                 previous_error = Some(error);
             }
             Attempt::Rejected(reason) => {
