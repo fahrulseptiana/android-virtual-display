@@ -208,8 +208,16 @@ negotiation from Phase 2.
 - [x] H.264 through MediaCodec (`vd-client::media_codec`), the NDK C API via a
       small FFI layer. Output is requested as NV12 and converted to RGBA on the
       CPU. Measured on the tablet: **7.8 fps**, against ~2 fps for JPEG.
-- [ ] Zero-copy output: decode to a `Surface`/`AHardwareBuffer` so frames never
-      touch the CPU (the YUV→RGBA step is the remaining CPU cost).
+- [ ] Zero-copy output: decode to a `Surface` so frames never touch the CPU.
+      Measured on the tablet at 720p: decode **plus** the YUV→RGBA conversion
+      costs 18.5 ms, the egui texture upload 10.2 ms, but the whole UI repaint
+      takes ~105 ms — and halving the resolution to 960x540 cuts the repaint to
+      ~71 ms and raises the rate from 9.5 to 14 fps. The bottleneck is therefore
+      **filling the screen with the video texture through egui/wgpu**, not the
+      codec and not the host. The fix is a `Surface`: `MediaCodec` can decode
+      straight to the `NativeActivity`'s `ANativeWindow`, which the display
+      hardware composites for free. That means the app is either showing its
+      egui UI or showing video full-screen, not both at once.
 - [ ] Adaptive: drop late frames rather than queueing; track decode/render
       timings for the latency budget.
 - [ ] Handle rotation, notch/cutout, and backgrounding (pause capture when the
