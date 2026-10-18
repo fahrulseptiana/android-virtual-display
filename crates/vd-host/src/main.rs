@@ -148,14 +148,14 @@ fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
 
     Some(Box::new(|width, height, fps| {
         let gpu = gpu::create_device().map_err(|err| err.to_string())?;
-        let prefer_hardware = std::env::var("VD_ENCODER").as_deref() != Ok("software");
+        let preference = encoder_preference();
         let encoder = encoder::h264::H264Encoder::new(
             &gpu.device,
             width,
             height,
             fps,
             8_000_000,
-            prefer_hardware,
+            &preference,
         )
         .map_err(|err| err.to_string())?;
         Ok(Box::new(encoder) as Box<dyn video::VideoEncoder>)
@@ -167,6 +167,18 @@ fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
     None
 }
 
+/// Encoder choice from `VD_ENCODER`: `hardware` (default), `software`, or a
+/// friendly-name substring such as `dx12`.
+#[cfg(windows)]
+fn encoder_preference() -> encoder::media_foundation::EncoderPreference {
+    use encoder::media_foundation::EncoderPreference;
+    match std::env::var("VD_ENCODER").as_deref() {
+        Ok("software") => EncoderPreference::SoftwareFirst,
+        Ok("hardware") | Err(_) => EncoderPreference::HardwareFirst,
+        Ok(name) => EncoderPreference::Named(name.to_owned()),
+    }
+}
+
 /// Diagnostic: encode a few synthetic frames and report, so the hardware encoder
 /// can be verified without a client.
 #[cfg(windows)]
@@ -174,14 +186,14 @@ fn encoder_check(gpu: &gpu::GpuDevice, width: u32, height: u32) {
     // NV12 subsamples chroma 2x2, so the dimensions must be even.
     let (width, height) = (width & !1, height & !1);
 
-    let prefer_hardware = std::env::var("VD_ENCODER").as_deref() != Ok("software");
+    let preference = encoder_preference();
     let mut encoder = match encoder::h264::H264Encoder::new(
         &gpu.device,
         width,
         height,
         30,
         8_000_000,
-        prefer_hardware,
+        &preference,
     ) {
         Ok(encoder) => encoder,
         Err(err) => {

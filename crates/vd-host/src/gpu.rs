@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
 
 /// A Direct3D 11 device and its immediate context.
@@ -21,7 +21,7 @@ pub struct GpuDevice {
     pub context: ID3D11DeviceContext,
 }
 
-/// Creates a hardware D3D11 device with BGRA support (needed by DXGI capture).
+/// Creates a hardware D3D11 device with BGRA and video support.
 pub fn create_device() -> Result<GpuDevice, String> {
     let mut device = None;
     let mut context = None;
@@ -33,7 +33,9 @@ pub fn create_device() -> Result<GpuDevice, String> {
             None,
             D3D_DRIVER_TYPE_HARDWARE,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            // BGRA is needed by DXGI capture; VIDEO_SUPPORT is needed before a
+            // hardware encoder will accept this device as its manager.
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             Some(&[
                 D3D_FEATURE_LEVEL_11_0,
                 D3D_FEATURE_LEVEL_10_1,

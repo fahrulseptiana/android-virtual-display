@@ -12,15 +12,26 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use log::debug;
-use windows::core::Interface;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFTransform, MFMediaType_Video, MFStartup, MFTEnumEx,
+    IMFActivate, IMFTransform, MFMediaType_Video, MFStartup, MFTEnumEx,
     MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264,
-    MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO, MF_TRANSFORM_ASYNC,
+    MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO, MF_LOW_LATENCY, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+
+/// Which encoder to prefer when several are available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncoderPreference {
+    /// GPU transforms first, then software.
+    HardwareFirst,
+    /// The software encoder first.
+    SoftwareFirst,
+    /// Only transforms whose friendly name contains this (case-insensitive),
+    /// then software as a fallback.
+    Named(String),
+}
 
 /// One H.264 encoder Media Foundation can see.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +40,9 @@ pub struct EncoderInfo {
     pub name: String,
     /// True when the transform advertises a hardware URL, i.e. it runs on the GPU.
     pub hardware: bool,
+    /// Asynchronous transforms are driven by their event queue, not by
+    /// calling ProcessInput/ProcessOutput directly.
+    pub is_async: bool,
 }
 
 /// Starts COM and Media Foundation once per process.
@@ -65,22 +79,34 @@ pub fn h264_encoders() -> Result<Vec<EncoderInfo>, String> {
     Ok(encoders)
 }
 
-/// Activates the best available H.264 encoder.
-///
-/// `prefer_hardware` puts GPU transforms first; otherwise the software encoder
-/// is tried first (useful to isolate driver problems).
-pub fn activate_h264_encoder(prefer_hardware: bool) -> Result<(EncoderInfo, IMFTransform), String> {
+/// Activates the best available H.264 encoder for `preference`.
+pub fn activate_h264_encoder(
+    preference: &EncoderPreference,
+) -> Result<(EncoderInfo, IMFTransform), String> {
     ensure_started()?;
 
     let mut candidates = unsafe { enumerate_activates() }?;
-    if !prefer_hardware {
-        candidates.sort_by_key(|activate| {
-            usize::from(
+    let is_hardware = |activate: &IMFActivate| {
+        unsafe { describe(activate) }
+            .map(|info| info.hardware)
+            .unwrap_or(false)
+    };
+
+    match preference {
+        EncoderPreference::HardwareFirst => {
+            candidates.sort_by_key(|activate| usize::from(!is_hardware(activate)));
+        }
+        EncoderPreference::SoftwareFirst => {
+            candidates.sort_by_key(|activate| usize::from(is_hardware(activate)));
+        }
+        EncoderPreference::Named(name) => {
+            let wanted = name.to_ascii_lowercase();
+            candidates.retain(|activate| {
                 unsafe { describe(activate) }
-                    .map(|info| info.hardware)
-                    .unwrap_or(false),
-            )
-        });
+                    .map(|info| info.name.to_ascii_lowercase().contains(&wanted))
+                    .unwrap_or(false)
+            });
+        }
     }
 
     for activate in candidates {
@@ -100,23 +126,27 @@ pub fn activate_h264_encoder(prefer_hardware: bool) -> Result<(EncoderInfo, IMFT
 
         match unsafe { activate.ActivateObject::<IMFTransform>() } {
             Ok(transform) => {
-                // The unlock must also be set on the transform itself, otherwise
-                // ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER) fails with
-                // MF_E_TRANSFORM_ASYNC_LOCKED.
-                match transform.cast::<IMFAttributes>() {
+                // `MF_TRANSFORM_ASYNC_UNLOCK` must be set on the transform's own
+                // attribute store; without it every later call fails with
+                // MF_E_TRANSFORM_ASYNC_LOCKED. `IMFTransform::GetAttributes` is
+                // the accessor to use — casting to IMFAttributes fails on some
+                // transforms (AMDh264Encoder returns E_NOINTERFACE).
+                match unsafe { transform.GetAttributes() } {
                     Ok(attributes) => {
-                        if let Err(err) =
-                            unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
-                        {
-                            debug!("could not unlock {name} on the transform: {err}");
-                        }
+                        let unlock = unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) };
+                        let unlocked = unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK) }
+                            .unwrap_or(0);
+                        debug!("{name}: unlock {unlock:?}, MF_TRANSFORM_ASYNC_UNLOCK = {unlocked}");
+                        // Ask for as little lookahead latency as possible.
+                        let _ = unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) };
                     }
-                    Err(err) => debug!("could not query IMFAttributes on {name}: {err}"),
+                    Err(err) => debug!("could not get the attributes of {name}: {err}"),
                 }
 
                 let info = info.unwrap_or(EncoderInfo {
                     name,
                     hardware: false,
+                    is_async,
                 });
                 return Ok((info, transform));
             }
@@ -136,8 +166,11 @@ unsafe fn enumerate_activates() -> Result<Vec<IMFActivate>, String> {
 
     // First pass asks for hardware encoders only; the second lists everything,
     // so a machine without a GPU encoder still finds the software fallback.
+    // Note: no MFT_ENUM_FLAG_ASYNCMFT. Asking for async transforms returns
+    // activations that cannot be unlocked on some drivers; the plain hardware
+    // enumeration yields ones that can.
     let passes = [
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
         MFT_ENUM_FLAG_SORTANDFILTER,
     ];
 
@@ -179,6 +212,7 @@ unsafe fn describe(activate: &IMFActivate) -> Option<EncoderInfo> {
         hardware: activate
             .GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute)
             .is_ok(),
+        is_async: activate.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0,
     })
 }
 

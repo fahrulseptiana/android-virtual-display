@@ -6,22 +6,30 @@
 //! as a later optimisation.
 
 use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
 
 use log::debug;
 use vd_core::codec::CodecError;
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncH264VProfile_Main, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFTransform, MFCreateDXGIDeviceManager, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    eAVEncH264VProfile_Main, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEvent,
+    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
+    METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT,
+    MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
 };
 
-use super::media_foundation::{activate_h264_encoder, EncoderInfo};
+use super::media_foundation::{activate_h264_encoder, EncoderInfo, EncoderPreference};
+
+/// How long to keep serving an asynchronous encoder for one frame.
+const ASYNC_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Why encoding failed.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +62,8 @@ pub struct H264Encoder {
     bitrate: u32,
     sequence_header: Vec<u8>,
     frame_index: u64,
+    /// Asynchronous transforms are driven by their event queue.
+    events: Option<IMFMediaEventGenerator>,
 }
 
 impl H264Encoder {
@@ -64,11 +74,11 @@ impl H264Encoder {
         height: u32,
         fps: u32,
         bitrate: u32,
-        prefer_hardware: bool,
+        preference: &EncoderPreference,
     ) -> Result<Self, EncodeError> {
         // SAFETY: all calls below are documented Media Foundation usage; the
         // transform is owned by `self` and only used from the encoding thread.
-        unsafe { Self::create(device, width, height, fps, bitrate, prefer_hardware) }
+        unsafe { Self::create(device, width, height, fps, bitrate, preference) }
     }
 
     unsafe fn create(
@@ -77,26 +87,33 @@ impl H264Encoder {
         height: u32,
         fps: u32,
         bitrate: u32,
-        prefer_hardware: bool,
+        preference: &EncoderPreference,
     ) -> Result<Self, EncodeError> {
-        // Hardware first (unless the caller asked otherwise), then software: a
-        // driver that cannot be configured must not cost us encoding entirely.
-        for hardware_first in [prefer_hardware, !prefer_hardware] {
-            match Self::configure(device, width, height, fps, bitrate, hardware_first) {
+        // Try the requested order, then the opposite: a driver that cannot be
+        // configured must not cost us encoding entirely.
+        let attempts: Vec<EncoderPreference> = match preference {
+            EncoderPreference::HardwareFirst => {
+                vec![preference.clone(), EncoderPreference::SoftwareFirst]
+            }
+            EncoderPreference::SoftwareFirst => {
+                vec![preference.clone(), EncoderPreference::HardwareFirst]
+            }
+            EncoderPreference::Named(_) => {
+                vec![preference.clone(), EncoderPreference::SoftwareFirst]
+            }
+        };
+
+        let mut last = String::from("no encoder was tried");
+        for attempt in &attempts {
+            match Self::configure(device, width, height, fps, bitrate, attempt) {
                 Ok(encoder) => return Ok(encoder),
-                Err(err) => debug!(
-                    "{} encoder unusable: {err}",
-                    if hardware_first {
-                        "hardware"
-                    } else {
-                        "software"
-                    }
-                ),
+                Err(err) => {
+                    debug!("encoder preference {attempt:?} unusable: {err}");
+                    last = err.to_string();
+                }
             }
         }
-        Err(EncodeError::Configure(
-            "no H.264 encoder could be configured".to_owned(),
-        ))
+        Err(EncodeError::Configure(last))
     }
 
     unsafe fn configure(
@@ -105,13 +122,14 @@ impl H264Encoder {
         height: u32,
         fps: u32,
         bitrate: u32,
-        prefer_hardware: bool,
+        preference: &EncoderPreference,
     ) -> Result<Self, EncodeError> {
         let (info, transform) =
-            activate_h264_encoder(prefer_hardware).map_err(EncodeError::MediaFoundation)?;
+            activate_h264_encoder(preference).map_err(EncodeError::MediaFoundation)?;
 
         // Hardware transforms expect a D3D device manager, even when the samples
         // themselves come from system memory.
+        debug!("encoder setup: creating the D3D device manager");
         let mut token = 0u32;
         let mut manager: Option<IMFDXGIDeviceManager> = None;
         MFCreateDXGIDeviceManager(&mut token, &mut manager).map_err(|err| {
@@ -119,18 +137,27 @@ impl H264Encoder {
         })?;
         let manager = manager
             .ok_or_else(|| EncodeError::MediaFoundation("no D3D device manager".to_owned()))?;
+        debug!("encoder setup: assigning the device");
         manager
             .ResetDevice(device, token)
             .map_err(|err| EncodeError::MediaFoundation(format!("ResetDevice: {err}")))?;
         // Recommended for hardware transforms, but some refuse it; carry on
         // either way and let ProcessInput report a real problem.
-        if let Err(err) = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, token as usize) {
+        debug!("encoder setup: setting the D3D manager");
+        // ulParam is a pointer to the device manager itself, not the reset token
+        // (the token is only used by ResetDevice).
+        let manager_ptr = Interface::as_raw(&manager) as usize;
+        if let Err(err) = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
             debug!("could not set the D3D manager on the encoder: {err}");
         }
+        debug!("encoder setup: D3D manager done");
 
         // Encoders want the output type first.
+        debug!("encoder setup: choosing the output type");
         set_output_type(&transform, width, height, fps, bitrate)?;
+        debug!("encoder setup: choosing the input type");
         set_input_type(&transform, width, height, fps)?;
+        debug!("encoder setup: types negotiated");
 
         let sequence_header = output_sequence_header(&transform)?;
 
@@ -155,9 +182,22 @@ impl H264Encoder {
             sequence_header.len(),
         );
 
+        let events = if info.is_async {
+            match transform.cast::<IMFMediaEventGenerator>() {
+                Ok(events) => Some(events),
+                Err(err) => {
+                    debug!("could not get the encoder's event generator: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             transform,
             _manager: manager,
+            events,
             info,
             width,
             height,
@@ -204,8 +244,20 @@ impl H264Encoder {
             )));
         }
 
-        let mut outputs = Vec::new();
         let sample = unsafe { self.make_sample(nv12, timestamp_us)? };
+        let outputs = if self.events.is_some() {
+            self.encode_async(sample)?
+        } else {
+            self.encode_sync(sample)?
+        };
+
+        self.frame_index += 1;
+        Ok(outputs)
+    }
+
+    /// Synchronous transforms are driven by simply feeding and draining.
+    fn encode_sync(&mut self, sample: IMFSample) -> Result<Vec<Vec<u8>>, EncodeError> {
+        let mut outputs = Vec::new();
 
         // The encoder may still be holding the previous frame.
         outputs.extend(self.drain()?);
@@ -220,7 +272,67 @@ impl H264Encoder {
         }
 
         outputs.extend(self.drain()?);
-        self.frame_index += 1;
+        Ok(outputs)
+    }
+
+    /// Asynchronous transforms tell us when to read and write through their
+    /// event queue; calling ProcessInput/ProcessOutput directly fails with
+    /// E_UNEXPECTED on those.
+    fn encode_async(&mut self, sample: IMFSample) -> Result<Vec<Vec<u8>>, EncodeError> {
+        // Cloned (a refcount bump) so `self` stays free for `process_one`.
+        let events = self
+            .events
+            .clone()
+            .ok_or_else(|| EncodeError::Encode("encoder has no event generator".to_owned()))?;
+
+        let mut outputs = Vec::new();
+        let mut fed = false;
+        let deadline = Instant::now() + ASYNC_TIMEOUT;
+
+        while Instant::now() < deadline {
+            let event: IMFMediaEvent = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => event,
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    // Nothing pending: wait a moment for the encoder.
+                    if fed && !outputs.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(err) => return Err(EncodeError::Encode(format!("GetEvent: {err}"))),
+            };
+
+            let kind = unsafe { event.GetType() }.unwrap_or(0);
+            if kind == METransformNeedInput.0 as u32 {
+                if !fed {
+                    match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+                        Ok(()) => fed = true,
+                        Err(err) if err.code() == MF_E_NOTACCEPTING => {}
+                        Err(err) => {
+                            return Err(EncodeError::Encode(format!("ProcessInput: {err}")))
+                        }
+                    }
+                }
+            } else if kind == METransformHaveOutput.0 as u32 {
+                match self.process_one()? {
+                    Output::Unit(unit) => outputs.push(unit),
+                    Output::Empty | Output::Pending => {}
+                }
+            } else if kind == METransformDrainComplete.0 as u32 {
+                break;
+            }
+
+            if fed && !outputs.is_empty() {
+                break;
+            }
+        }
+
+        if !fed {
+            return Err(EncodeError::Encode(
+                "the encoder never asked for input".to_owned(),
+            ));
+        }
         Ok(outputs)
     }
 
@@ -236,65 +348,85 @@ impl H264Encoder {
         }
     }
 
+    /// Drains every access unit the encoder currently has.
     fn drain(&mut self) -> Result<Vec<Vec<u8>>, EncodeError> {
         let mut outputs = Vec::new();
-
-        // Some encoders hand back a sample; others expect the caller to supply
-        // one. Ask which, once per call (it is cheap and can change).
-        let stream = unsafe { self.transform.GetOutputStreamInfo(0) }
-            .unwrap_or(MFT_OUTPUT_STREAM_INFO::default());
-        let provides_samples = (stream.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
-
         loop {
-            let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                // SAFETY: ProcessOutput fills these in; taking them below
-                // releases the references exactly once.
-                pSample: ManuallyDrop::new(None),
-                dwStatus: 0,
-                pEvents: ManuallyDrop::new(None),
-            };
-
-            if !provides_samples {
-                let sample = unsafe { MFCreateSample() }
-                    .map_err(|err| EncodeError::Encode(format!("MFCreateSample: {err}")))?;
-                let size = stream.cbSize.max(1 << 20);
-                let memory = unsafe { MFCreateMemoryBuffer(size) }
-                    .map_err(|err| EncodeError::Encode(format!("MFCreateMemoryBuffer: {err}")))?;
-                unsafe {
-                    sample
-                        .AddBuffer(&memory)
-                        .map_err(|err| EncodeError::Encode(format!("AddBuffer: {err}")))?;
-                }
-                buffer.pSample = ManuallyDrop::new(Some(sample));
-            }
-
-            let mut status = 0u32;
-
-            let result = unsafe {
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
-            };
-
-            match result {
-                Ok(()) => {
-                    let sample = unsafe { ManuallyDrop::take(&mut buffer.pSample) };
-                    let _events = unsafe { ManuallyDrop::take(&mut buffer.pEvents) };
-                    if let Some(sample) = sample {
-                        if let Some(bytes) = sample_bytes(&sample)? {
-                            if !bytes.is_empty() {
-                                outputs.push(bytes);
-                            }
-                        }
-                    }
-                }
-                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                Err(err) => return Err(EncodeError::Encode(format!("ProcessOutput: {err}"))),
+            match self.process_one()? {
+                Output::Unit(unit) => outputs.push(unit),
+                // A sample with no bytes is fine; keep looking.
+                Output::Empty => continue,
+                Output::Pending => break,
             }
         }
         Ok(outputs)
     }
 
+    /// Runs a single `ProcessOutput`.
+    fn process_one(&mut self) -> Result<Output, EncodeError> {
+        // Some encoders hand back a sample; others expect the caller to supply
+        // one. The flag is cheap to read and can change.
+        let stream = unsafe { self.transform.GetOutputStreamInfo(0) }
+            .unwrap_or(MFT_OUTPUT_STREAM_INFO::default());
+        let provides_samples = (stream.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+
+        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            // SAFETY: ProcessOutput fills these in; taking them below releases
+            // the references exactly once.
+            pSample: ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        };
+
+        if !provides_samples {
+            let sample = unsafe { MFCreateSample() }
+                .map_err(|err| EncodeError::Encode(format!("MFCreateSample: {err}")))?;
+            let size = stream.cbSize.max(1 << 20);
+            let memory = unsafe { MFCreateMemoryBuffer(size) }
+                .map_err(|err| EncodeError::Encode(format!("MFCreateMemoryBuffer: {err}")))?;
+            unsafe {
+                sample
+                    .AddBuffer(&memory)
+                    .map_err(|err| EncodeError::Encode(format!("AddBuffer: {err}")))?;
+            }
+            buffer.pSample = ManuallyDrop::new(Some(sample));
+        }
+
+        let mut status = 0u32;
+        let result = unsafe {
+            self.transform
+                .ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status)
+        };
+
+        let sample = unsafe { ManuallyDrop::take(&mut buffer.pSample) };
+        let _events = unsafe { ManuallyDrop::take(&mut buffer.pEvents) };
+
+        match result {
+            Ok(()) => match sample {
+                Some(sample) => match sample_bytes(&sample)? {
+                    Some(bytes) if !bytes.is_empty() => Ok(Output::Unit(bytes)),
+                    _ => Ok(Output::Empty),
+                },
+                None => Ok(Output::Empty),
+            },
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(Output::Pending),
+            Err(err) => Err(EncodeError::Encode(format!("ProcessOutput: {err}"))),
+        }
+    }
+}
+
+/// One `ProcessOutput` outcome.
+enum Output {
+    /// An access unit.
+    Unit(Vec<u8>),
+    /// A sample with no payload; keep draining.
+    Empty,
+    /// The encoder needs more input.
+    Pending,
+}
+
+impl H264Encoder {
     unsafe fn make_sample(&self, nv12: &[u8], timestamp_us: u64) -> Result<IMFSample, EncodeError> {
         let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(nv12.len() as u32)
             .map_err(|err| EncodeError::Encode(format!("MFCreateMemoryBuffer: {err}")))?;
@@ -362,6 +494,8 @@ unsafe fn set_output_type(
         let _ = media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_pair(1, 1));
         let _ = media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
         let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32);
+        // Hardware encoders commonly require this on the output type.
+        let _ = media_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
 
         if transform.SetOutputType(0, &media_type, 0).is_ok() {
             return Ok(());
