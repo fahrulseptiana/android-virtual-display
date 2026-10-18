@@ -6,18 +6,27 @@ Two apps, one shared codebase:
 
 | App | Platform | Crate | What it does |
 |-----|----------|-------|--------------|
-| **Host** | Windows | `crates/vd-host` | Runs on the PC, announces itself on the LAN. Later: captures the desktop and encodes a video stream. |
-| **Client** | Android | `crates/vd-client` | Runs on the tablet/phone, discovers hosts. Later: decodes and renders the stream. |
+| **Host** | Windows | `crates/vd-host` | Runs on the PC: announces itself on the LAN, captures a display, encodes and streams it, and switches display when asked. |
+| **Client** | Android | `crates/vd-client` | Runs on the tablet: discovers hosts, decodes and renders the stream, and chooses which display to watch. |
 
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: 720p30, hardware on both ends.** The client discovers a host, pairs,
-> opens an encrypted session and displays the live Windows desktop — DXGI
-> capture (with the mouse cursor) → AMD hardware H.264 encode → MediaCodec
-> hardware decode — sustained at the host's 30 fps target. The UI is a
-> searching ripple, a tappable host list and a full-screen desktop. Remaining
-> work is input forwarding and authenticated pairing. See PLAN.md.
+> **Status: mirror or extend, 720p30, hardware on both ends.** The client
+> discovers a host, pairs, opens an encrypted session and displays the live
+> Windows desktop — DXGI capture (with the mouse cursor) → AMD hardware H.264
+> encode → MediaCodec hardware decode — sustained at the host's 30 fps target.
+>
+> With a virtual display installed the tablet can be a **second monitor** rather
+> than a copy of an existing one: the client offers *mirror* or *extend*, and the
+> host switches between them without dropping the session. Extending onto a
+> monitor created at the tablet's size is also what makes the 4K downscale
+> unnecessary — once the stream size follows it (Phase 7 step 4), scaling costs
+> 0 ms instead of 17 ms.
+>
+> The UI is a searching ripple, a tappable host list and a full-screen desktop
+> with an overlay that a tap hides. Remaining work is input forwarding and
+> authenticated first pairing. See PLAN.md.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -33,6 +42,9 @@ Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 │   │   └── src
 │   │       ├── protocol.rs        # HostInfo, DiscoveryMessage, Envelope (JSON over UDP)
 │   │       ├── net.rs             # PacketIo trait + UdpPacketIo implementation
+│   │       ├── clock.rs           # one monotonic clock, shared for timestamps
+│   │       ├── latency.rs         # clock offset (NTP-style) + measurement stats
+│   │       ├── display.rs         # DisplayInfo/DisplayKind: what a host could show
 │   │       ├── discovery          # browser.rs (client) + responder.rs (host)
 │   │       ├── session            # control channel
 │   │       │   ├── mod.rs         # SessionMessage + capability types
@@ -49,16 +61,22 @@ Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 │   │   └── src
 │   │       ├── main.rs            # wiring, settings, diagnostics
 │   │       ├── gpu.rs             # the shared D3D11 device
-│   │       ├── dxgi.rs            # Desktop Duplication + cursor compositing
-│   │       ├── encoder/h264.rs    # Media Foundation hardware H.264
-│   │       ├── video.rs           # capture → encode → broadcast
+│   │       ├── dxgi.rs            # output enumeration, Desktop Duplication, cursor
+│   │       ├── displays.rs        # outputs described for a client, and classified
+│   │       ├── encoder            # Media Foundation h264 (hardware), controls, selection
+│   │       ├── video.rs           # capture → encode → broadcast, and switching display
 │   │       ├── control.rs         # TCP control server (per-connection thread)
-│   │       └── identity.rs        # stable host id
+│   │       ├── identity.rs        # stable host id + long-lived identity key
+│   │       ├── tray.rs            # notification-area icon
+│   │       └── single_instance.rs # one host per machine
 │   └── vd-client                  # Android client + desktop harness
 │       └── src
-│           ├── app.rs             # UI: searching / host list / full-screen
+│           ├── app.rs             # UI: searching / host list / full-screen + overlay
 │           ├── connection.rs      # session worker, decode thread, reconnects
 │           ├── frames.rs          # bounded decoded-frame queue
+│           ├── latency.rs         # per-stage timings, for the overlay and logs
+│           ├── trust.rs           # remembered host identities
+│           ├── visibility.rs      # whether the UI is drawing, for pausing video
 │           └── media_codec.rs     # Android MediaCodec FFI (NDK)
 └── android                        # Gradle project that packages the APK
     └── app/src/main
@@ -146,9 +164,15 @@ single-slot channel, so a slow client misses frames instead of queueing them.
 Capture pauses entirely when nobody is watching.
 
 The client decodes on its own thread and queues the result for the UI, which
-draws one frame per repaint. Both the decoder's queue and the UI's are bounded
-and drop the oldest frame rather than growing, so a slow moment costs frames
-instead of latency.
+draws one frame per repaint. Frames are drawn in order until one has fallen well
+behind the freshest waiting — a hardware decoder returns two pictures at once, so
+keeping only the newest would halve the apparent frame rate and save nothing —
+and the queues are bounded, so a slow moment costs frames instead of latency.
+
+Changing display is a live operation. The capture thread swaps its source, asks
+for a keyframe so that no decoder is left predicting into a picture it has never
+seen, and rebuilds the encoder when the new display fits to a different stream
+size; the client is told through the config generation and reconfigures itself.
 
 > H.264 is the default (Media Foundation on the host, MediaCodec on the
 > tablet); `VD_CODEC=jpeg` forces the older JPEG path, which also serves as the
@@ -164,6 +188,44 @@ man-in-the-middle hole and removes the PIN prompt on reconnects.
 The *first* pairing is still unauthenticated in the strict sense — the host does
 not display the PIN, so there is nothing to compare out of band. See
 [PLAN.md](PLAN.md#security).
+
+---
+
+## Using the tablet as a second monitor
+
+Mirroring needs nothing beyond the host and the app. Extending needs Windows to
+believe in a monitor with no panel behind it, which is what an indirect display
+driver is for — and there is already a good one.
+
+The **Virtual Display Driver** is MIT licensed, signed with a certificate Windows
+accepts, and used by Sunshine, OBS and VR setups. This project neither ships nor
+requires its own driver; it captures a virtual monitor that exists.
+
+```powershell
+# Elevated, once. Downloads the driver, trusts its certificate, installs it and
+# writes its mode list with the tablet's 1920x1200 first.
+scripts\install-vdd.ps1
+```
+
+Reboot afterwards, since the monitor is enumerated at boot. The client's
+**Extend** button then becomes available, and the host switches between mirroring
+and extending without dropping the session.
+
+Three things worth knowing:
+
+* VDD's own notes warn that Windows may promote a monitor with nothing attached,
+  scrambling display priority and leaving the real screen black after a GPU
+  driver update. Uninstall before updating GPU drivers, and keep
+  `scripts\install-vdd.ps1 -Uninstall` to hand.
+* Extend mode is also where the pipeline gets faster, but it is only half the
+  change: the monitor has to exist at the tablet's size *and* the stream has to be
+  that size. `VD_VIDEO_SIZE` defaults to 1280x800, so extending still downscales
+  unless it is raised to match — at 1920x1200 the scaling costs 0 ms instead of
+  17 ms. Making the stream size follow the display is step 4 of Phase 7.
+* Which displays are offered comes from the host, and whether one is *virtual* is
+  a heuristic on the monitor's hardware id -- the honest answer needs
+  `DISPLAYCONFIG`'s output technology. A monitor not recognised as virtual simply
+  does not offer Extend.
 
 ---
 
@@ -193,13 +255,14 @@ Environment variables:
 |----------|---------|---------|
 | `RUST_LOG` | log level, e.g. `debug` | `info` |
 | `VD_HOST_NAME` | overrides the advertised machine name | machine name |
-| `VD_OUTPUT` | which monitor to duplicate | `0` |
+| `VD_OUTPUT` | which display to start on; the client changes it afterwards | `0` |
 | `VD_VIDEO_SIZE` | stream size, `WxH` — the stream is downscaled to fit | `1280x800` |
 | `VD_VIDEO_FPS` | encoder target frame rate | `30` |
 | `VD_VIDEO_BITRATE` | encoder target bitrate, bits per second | `8000000` |
 | `VD_CODEC` | `jpeg` forces the fallback codec | H.264 |
 | `VD_ENCODER` | `software` forces the software encoder, or a name substring such as `dx12` | hardware first |
 | `VD_ENCODER_CHECK` | encode 30 synthetic frames, print the result and exit (a diagnostic) | off |
+| `VD_LIST_OUTPUTS` | list every display output and whether it can be duplicated, then exit | off |
 
 The host id is generated once and stored in
 `%LOCALAPPDATA%\id.fahrul.vd\host-id`, so clients recognise the machine across
@@ -278,6 +341,10 @@ The project deliberately leans on a few principles:
 - [x] Hardware (GPU) H.264 encode (AMD hardware MFT)
 - [x] Mouse cursor mirrored from the host
 - [x] Client UI: searching ripple → host list → full-screen, back to return
+- [x] Extend as well as mirror: the tablet chooses the display, and the host
+      switches live ([why a virtual display](PLAN.md))
+- [x] The tablet as a real second monitor, via a signed virtual display driver
+- [x] Overlay on the stream — mirror/extend and latency — hidden by a tap
 - [ ] Touch / keyboard input forwarding
 - [x] Trust-on-first-use host identity (authenticated pairing, silent reconnects)
 - [ ] Zero-copy: D3D11 video processor on the host, Surface on the client

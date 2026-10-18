@@ -42,7 +42,8 @@ over Wi-Fi, with input flowing back to the PC, at a latency that feels native.
 │                                                                             │
 │  vd-host                                                                    │
 │   ├── discovery::Responder        UDP 47700  (probe / announce / bye)       │
-│   ├── control server              TCP 47701  (handshake, caps, input)       │
+│   ├── control server              TCP 47701  (handshake, caps, choice)      │
+│   ├── displays (DXGI)             every output, and the one being watched   │
 │   ├── capture (DXGI)              desktop frame + cursor, downscaled        │
 │   ├── encode (Media Foundation)   hardware H.264 bitstream                  │
 │   └── input injection (SendInput) mouse / keyboard          ← not yet       │
@@ -57,6 +58,7 @@ over Wi-Fi, with input flowing back to the PC, at a latency that feels native.
 │   ├── control client              TCP 47701                                 │
 │   ├── MediaCodec decode           H.264 → NV12 → RGBA                       │
 │   ├── render (egui + wgpu)        searching / host list / full-screen video │
+│   ├── overlay (egui)              mirror or extend, latency, tap to hide    │
 │   └── input capture               touch / keyboard → host    ← not yet      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -196,8 +198,12 @@ protected, because a different key is challenged.
       a D3D11 texture rather than a CPU buffer, which suits the zero-copy work
       better than duplication does.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
-- [ ] Pick a monitor at runtime rather than by index; handle monitors appearing
-      and disappearing.
+- [x] Pick a display at runtime rather than at startup: the client chooses and
+      the host swaps capture sources live, without dropping the session
+      (Phase 7).
+- [ ] Notice the display set *changing* -- a monitor plugged in, a laptop docked,
+      a virtual display removed -- and tell the client, rather than leaving it
+      with a list that was true when the session began.
 
 ### Phase 4 — Video encode
 
@@ -397,11 +403,17 @@ rather than reasoned about:
       highlight follows what is being captured rather than what was asked for.
       Remembering the choice per host, and offering it before the stream starts
       rather than over it, are the obvious refinements.
-- [x] **Step 3 — fit the tablet.** `scripts/install-vdd.ps1` writes
-      `vdd_settings.xml` with 1920x1200 first, the tablet's panel in landscape, so
-      the monitor is created at the size the client has. Measured: streaming it
-      costs 0 ms of scaling against 17 ms to scale it down to 1280x800.
-- [ ] **Step 4 — a monitor per client**, so two tablets can have a screen each.
+- [x] **Step 3 — fit the tablet, as far as the monitor goes.**
+      `scripts/install-vdd.ps1` writes `vdd_settings.xml` with 1920x1200 first,
+      the tablet's panel in landscape, so the monitor is created at the size the
+      client has rather than at the host's.
+- [ ] **Step 4 — make the stream size follow the display.** `VD_VIDEO_SIZE` is
+      still a fixed 1280x800, so extending to a 1920x1200 monitor scales it down
+      anyway, at about 18 ms a frame, and the win Step 3 sets up is not actually
+      taken. Measured with the stream matching the monitor: 0 ms of scaling,
+      against 17 ms to scale that same monitor down. The size should come from the
+      display being captured, or from what the client asks for.
+- [ ] **Step 5 — a monitor per client**, so two tablets can have a screen each.
       Beyond the current one-viewer-per-host non-goal, so it waits on revisiting
       that rather than on anything here.
 
@@ -457,6 +469,12 @@ driver but loading one:
 - [ ] Keyboard (hardware + soft keyboard) → `SendInput` on Windows.
 - [ ] Back-pressure and ordering guarantees over the control channel.
 
+> A tap on the picture already means "show or hide the overlay" (Phase 7), and
+> this phase wants the same tap to reach the host. Decide which before writing
+> either: the usual answer is that the first tap wakes the controls and later
+> ones are forwarded, but a tap that sometimes clicks and sometimes does not is
+> worth being deliberate about. See open question 8.
+
 ### Phase 9 — Polish
 
 - [ ] Audio capture + `AudioTrack` playback.
@@ -493,19 +511,24 @@ limitation in Phase 2. Plan:
 
 ### Performance budgets (1080p60)
 
-| Stage | Budget | Measured (720p30, Wi-Fi) |
-|-------|--------|--------------------------|
-| Capture + scale | < 5 ms | ~28 ms (23 ms of it the 4K→720p downscale) |
+| Stage | Budget | Measured, mirroring 4K (720p30) |
+|-------|--------|---------------------------------|
+| Capture + scale | < 5 ms | ~28 ms, of which ~23 ms is the 4K downscale |
 | Encode | < 10 ms | 4 ms (hardware) |
 | Network (LAN) | < 5 ms | ~8 ms |
-| Decode | < 10 ms | not yet measured |
-| Render | < 5 ms | not yet measured |
-| **Total** | **< 50 ms** | 40.7 ms mean, 48 ms p95 on arrival |
+| Decode | < 10 ms | 19-25 ms |
+| Render | < 5 ms | 7-9 ms |
+| **Total** | **< 50 ms** | 41 ms to arrive, 90-135 ms to display |
 
-Instrumentation ships from Phase 3 onward so regressions are visible. The
-measured column covers only up to the frame *arriving*; decode, render and panel
-scan-out are still unmeasured, so the true glass-to-glass figure is higher than
-the one above.
+Instrumentation ships from Phase 3 onward so regressions are visible. The client
+measures the whole path up to the frame being drawn, which is why the total has
+two numbers: the first is the host and the network, the second what the client
+adds. Panel scan-out and the host's own capture latency sit outside both, so true
+glass-to-glass is higher again.
+
+Most of the budget is spent on avoidable work rather than on anything inherent:
+the downscale goes away by streaming at the display's own size (Phase 7 step 4),
+and the decode-and-upload cost by decoding to a `Surface` (open question 1).
 
 ### Testing
 
@@ -533,7 +556,7 @@ the one above.
 | **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
 | **M3 — First frame** ✅ | Synthetic capture → JPEG → encrypted TCP → decode → screen | 3–6 (minimal) |
 | **M4 — Usable** ✅ | Real DXGI capture, hardware H.264 both ends, 720p30, cursor mirrored, three-state UI | 3–6 |
-| **M5 — Extended** | Windows treats the tablet as a second monitor | 7 |
+| **M5 — Extended** ✅ | Windows treats the tablet as a second monitor: the client picks mirror or extend, and the host switches live | 7 |
 | **M6 — Interactive** | Input forwarding | 8 |
 | **M7 — Native feel** | 1080p60, < 50 ms, audio, packaging | 5–9 |
 
@@ -547,8 +570,9 @@ the one above.
 | Hardware encoder fragmentation | Device-specific bugs | Capability negotiation + software fallback |
 | DRM/protected content | Black frames | Document as unsupported; WGC is not a DRM bypass |
 | Android backgrounding kills the stream | Broken session | Done in Phase 6: the UI going quiet is taken as invisible and the host pauses |
-| Driver signing for a virtual monitor | Extend mode may be unreachable | Depend on an existing virtual display first; verify WHQL/attestation before promising a release |
-| A driver that refuses to load | Days lost on the wrong problem | Test-signing spike before any driver code; WDAC on this machine is a known unknown |
+| Driver signing for a virtual monitor | Extend mode would be unreachable | Not needed: a signed, MIT-licensed driver already exists, so nothing here is signed or redistributed. See Phase 7 |
+| The virtual display is someone else's driver | Extend depends on a third-party project | Permissively licensed and actively used; the host says plainly when no virtual display is available |
+| VDD can be promoted to primary after a GPU driver update | The real screen goes black on boot | Its own notes say to uninstall before updating GPU drivers; `install-vdd.ps1 -Uninstall` is kept for that |
 | Latency creep from copies | Too slow | Zero-copy paths, budget per stage, instrumentation |
 | Scope creep (audio, per-client monitors) | Never ships | Strict phase order; polish only after M4 |
 
@@ -560,8 +584,10 @@ the one above.
    timings: 19-25 ms decoding and 7-9 ms of texture work per frame puts the
    client over the whole budget on its own.
 2. ~~QUIC vs. custom UDP+FEC~~ — neither; see the transport decision in Phase 5.
-3. **Per-window capture (WGC) vs. per-monitor** — now a performance question, not
-   a feature one: per-monitor duplication is what forces the 4K→720p downscale.
+3. **Per-window capture (WGC) vs. per-monitor** — much less pressing than it
+   looked: extending creates a monitor at the client's size, which removes the
+   downscale outright (0 ms against 17 ms) rather than making it cheaper. What is
+   left of the argument is HDR and protected content.
 4. **Minimum supported Android version** — 31, and nothing in Phases 6-8 moves it.
 5. **Headless host service** — not as a Windows service; DXGI duplication needs
    the interactive session. Auto-start at logon instead.
@@ -569,3 +595,14 @@ the one above.
    needs it either way.
 7. **`LATE_AFTER_US` is tuned for 30 fps** — must follow the frame interval if the
    stream is ever run much slower.
+8. **The tap gesture is claimed twice.** A tap on the picture toggles the overlay,
+   and input forwarding will want that tap to reach the host instead. Settle it
+   before Phase 8 rather than after: a tap that sometimes clicks and sometimes
+   does not is worth being deliberate about.
+9. **Mirror or extend is chosen after connecting**, because the host's display
+   list only arrives with the session. Offering it while picking a host means the
+   host advertising its display kinds in the discovery beacon, and remembering the
+   choice per host.
+10. **Whether an output is virtual is a heuristic** — matched on the monitor's
+    hardware id, because that is the only place an indirect display names itself.
+    `DISPLAYCONFIG`'s output technology would answer it properly.
