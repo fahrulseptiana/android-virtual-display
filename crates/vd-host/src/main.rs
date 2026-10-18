@@ -37,14 +37,12 @@ fn main() -> vd_core::Result<()> {
     let mut responder = Responder::bind(config.clone(), host.clone())?;
 
     // One capture thread feeds every client.
+    let (width, height, fps) = video_settings();
     let broadcaster = video::Broadcaster::new();
     video::spawn_capture(
         broadcaster.clone(),
-        Box::new(TestPattern::new(
-            video::DEFAULT_WIDTH,
-            video::DEFAULT_HEIGHT,
-        )),
-        video::DEFAULT_FPS,
+        Box::new(TestPattern::new(width, height)),
+        fps,
     );
 
     let control =
@@ -88,6 +86,29 @@ fn main() -> vd_core::Result<()> {
 /// codec is advertised; input forwarding is planned.
 fn host_capabilities() -> Capabilities {
     Capabilities::default()
+}
+
+/// Stream geometry, overridable with `VD_VIDEO_SIZE=WxH` and `VD_VIDEO_FPS`.
+fn video_settings() -> (u32, u32, u32) {
+    let (mut width, mut height) = (video::DEFAULT_WIDTH, video::DEFAULT_HEIGHT);
+    if let Ok(size) = std::env::var("VD_VIDEO_SIZE") {
+        if let Some((w, h)) = size.split_once('x') {
+            match (w.trim().parse(), h.trim().parse()) {
+                (Ok(w), Ok(h)) => {
+                    width = w;
+                    height = h;
+                }
+                _ => warn!("ignoring malformed VD_VIDEO_SIZE={size:?}"),
+            }
+        }
+    }
+
+    let fps = std::env::var("VD_VIDEO_FPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(video::DEFAULT_FPS);
+
+    (width, height, fps)
 }
 
 fn install_ctrlc_handler(running: Arc<AtomicBool>) {

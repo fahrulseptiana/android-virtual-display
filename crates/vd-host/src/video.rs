@@ -73,6 +73,8 @@ pub fn spawn_capture(
     thread::spawn(move || {
         let mut sequence = 0u64;
         let mut streaming = false;
+        let mut published = 0u32;
+        let mut last_report = Instant::now();
         loop {
             let started = Instant::now();
 
@@ -99,6 +101,7 @@ pub fn spawn_capture(
                                 timestamp_us: captured.timestamp_us,
                             };
                             sequence = sequence.wrapping_add(1);
+                            published += 1;
                             broadcaster.publish(Arc::new(VideoFrame::new(header, encoded.data)));
                         }
                         Err(err) => warn!("could not encode a frame: {err}"),
@@ -113,6 +116,16 @@ pub fn spawn_capture(
 
             if let Some(remaining) = frame_interval.checked_sub(started.elapsed()) {
                 thread::sleep(remaining);
+            }
+
+            // Report the achieved rate so encode cost is visible in the logs.
+            if last_report.elapsed() >= Duration::from_secs(5) {
+                let seconds = last_report.elapsed().as_secs_f32();
+                if streaming {
+                    debug!("encoding at {:.1} fps", published as f32 / seconds);
+                }
+                published = 0;
+                last_report = Instant::now();
             }
         }
     });
