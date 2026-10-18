@@ -1,0 +1,183 @@
+# Contributing
+
+Thanks for taking the time to contribute! This document explains how the project
+is laid out, how to build and test it, and the conventions we follow.
+
+By participating you agree to keep the discussion respectful and technical. All
+contributions are accepted under the project's [MIT license](LICENSE).
+
+---
+
+## Getting started
+
+### Prerequisites
+
+| Tool | Why |
+|------|-----|
+| Rust stable | everything |
+| `cargo-ndk` | cross-compiling the Android client |
+| Android SDK + NDK | packaging the APK |
+| Android Studio (JBR) or any JDK 17+ | Gradle |
+| `adb` | installing/running on a device |
+
+```bash
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+```
+
+### Build and run
+
+```bash
+# Host (Windows)
+cargo run -p vd-host
+
+# Client — desktop harness (fastest way to iterate on the UI)
+cargo run -p vd-client
+cargo run -p vd-client --example discover   # headless, prints hosts
+
+# Client — Android
+scripts/build-android.sh
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n id.fahrul.vd/android.app.NativeActivity
+adb logcat -s vd-client
+```
+
+Before opening a pull request, run:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+---
+
+## Project layout
+
+```
+crates/vd-core     shared, platform-agnostic: protocol + discovery + (soon) session
+crates/vd-host     Windows host binary
+crates/vd-client   Android cdylib + desktop harness
+android/           Gradle project that packages id.fahrul.vd
+scripts/           developer scripts
+```
+
+See [PLAN.md](PLAN.md) for the roadmap and [README.md](README.md) for how
+discovery works today.
+
+---
+
+## Architecture rules
+
+These exist to keep the shared core genuinely shared. Please respect them:
+
+1. **`vd-core` must stay platform-agnostic and dependency-light.** No Windows
+   APIs, no Android APIs, no JNI, no threads, no filesystem. It is compiled for
+   both targets and for tests.
+2. **Talk to abstractions, not sockets.** Discovery and (soon) the session talk
+   to the `PacketIo` trait. If you need a new capability, extend the trait rather
+   than reaching for `UdpSocket`/`TcpStream` directly in the algorithm.
+3. **Keep it testable.** New logic in `vd-core` should be unit-testable with
+   `MockIo` and no network. A test that needs a real socket belongs in an
+   integration test.
+4. **YAGNI.** Don't build the next phase early. No video code paths until the
+   control channel exists; no config file until someone needs one.
+5. **One responsibility per type.** `Envelope` encodes, `Browser` tracks the
+   client's view, `Responder` announces. Don't merge them.
+6. **No panics in library code.** Return `Result`; the app may log and recover.
+   `unwrap()` in `vd-core` is a review blocker (tests excepted).
+
+---
+
+## Commit messages
+
+We use [Conventional Commits](https://www.conventionalcommits.org/). **Every
+commit must follow this format:**
+
+```
+<type>(<optional scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+Allowed types:
+
+| Type | Use for |
+|------|---------|
+| `feat` | a new feature |
+| `fix` | a bug fix |
+| `docs` | documentation only |
+| `refactor` | code change that is neither a feature nor a fix |
+| `perf` | performance improvement |
+| `test` | tests only |
+| `build` | build system, dependencies, packaging |
+| `ci` | CI configuration |
+| `chore` | maintenance that doesn't fit elsewhere |
+| `revert` | reverting a previous commit |
+
+Scopes (optional, but preferred): `core`, `host`, `client`, `android`, `deps`,
+`docs`.
+
+Rules:
+
+- Imperative, lower-case description, no trailing period:
+  `feat(core): add session handshake state machine`.
+- One logical change per commit. Keep commits reviewable.
+- A breaking change gets a `!` (`feat(core)!: ...`) and/or a
+  `BREAKING CHANGE:` footer.
+- Reference issues in the footer: `Closes #12`.
+
+Examples:
+
+```
+feat(core): add session handshake state machine
+fix(client): drop stale hosts after the TTL expires
+docs: document the discovery protocol
+build(android): exclude unused kotlin-stdlib from the APK
+refactor(core): move ports into the protocol module
+```
+
+---
+
+## Branches and pull requests
+
+- Branch from `main`. Use a descriptive, kebab-case name with a type prefix:
+  `feat/session-handshake`, `fix/host-ttl`.
+- Keep pull requests focused. If you find an unrelated bug, open a separate PR.
+- A PR should:
+  - explain **what** and **why** (link the PLAN milestone/phase),
+  - note how it was tested,
+  - keep CI green (`fmt`, `clippy -D warnings`, `test`).
+- Prefer several small, well-described commits over one giant commit.
+
+### Definition of done
+
+- [ ] `cargo fmt --all` applied.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- [ ] `cargo test --workspace` passes; new logic has tests.
+- [ ] Documentation updated (README / PLAN / inline rustdoc) when behaviour
+      changes.
+- [ ] Commits follow the convention above.
+
+---
+
+## Code style
+
+- Rust 2021, `rustfmt` defaults, `clippy` clean at `-D warnings`.
+- Public items get rustdoc; comment *why*, not *what*.
+- Keep functions small and name things after the domain (`Announce`, `Responder`,
+  not `Msg1`, `Manager`).
+- Errors: `thiserror` in libraries, `anyhow`-style context only in binaries.
+
+---
+
+## Reporting bugs / proposing features
+
+- Bugs: include the OS, Android version/device, host + client versions, and
+  relevant `adb logcat -s vd-client` / host logs.
+- Features: describe the use case first; check [PLAN.md](PLAN.md) to see whether
+  it is already scheduled.
+- Security issues: please **do not** open a public issue — contact the
+  maintainer directly.
