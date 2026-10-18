@@ -199,12 +199,27 @@ active man-in-the-middle who re-runs the exchange on both sides. See
       `MFT_MESSAGE_SET_D3D_MANAGER` wants the device-manager *pointer*, not the
       reset token; and async transforms must be driven through their event
       queue. Falls back to the software encoder automatically.
-- [ ] **Zero-copy input:** scale and convert to NV12 with the **D3D11 Video
+- [ ] **Zero-copy input.** Scale and convert to NV12 with the **D3D11 Video
       Processor** and hand the encoder a D3D11 texture, removing the 33 MB
-      readback and the 23 ms CPU downscale. See the
-      [GPU acceleration strategy](#gpu-acceleration-strategy-decision-record).
-- [ ] Rate control for Wi-Fi: variable bitrate with a capped bitrate, keyframe
-      on demand (first frame, loss recovery, resolution change).
+      readback and the ~23 ms CPU downscale. Two things have to be settled
+      first, which is why it is not simply a matter of swapping the scaler:
+      * the **cursor** is currently blended into the CPU BGRA buffer, and a
+        zero-copy path never has that buffer — so it must either be composited
+        on the GPU, or moved to the client as a position plus bitmap that the
+        client draws over the video (the more natural shape for a remote
+        display, and it also removes the cursor from the video for free);
+      * the duplicated texture is only valid between `AcquireNextFrame` and
+        `ReleaseFrame`, so the whole GPU conversion has to run inside that
+        window rather than being handed off.
+- [ ] Rate control is done (see below). The remaining headroom would mostly
+      fund a higher stream resolution, so this is worth doing alongside that,
+      not before it.
+- [x] Rate control for Wi-Fi: capped variable bitrate, a configurable mean
+      bitrate (`VD_VIDEO_BITRATE`) and **keyframes on demand**, all through
+      `ICodecAPI`. Verified supported by the AMD encoder. Forcing a keyframe
+      fixed a real bug: a reconnecting client used to sit on a blank screen for
+      up to the GOP length (~6 s here) because the encoder keeps emitting
+      predicted frames.
 - [ ] Optional, later: HEVC and AV1 (AV1 only where hardware decode exists).
 
 **Decision:** start with H.264 — it has the widest hardware decode support on

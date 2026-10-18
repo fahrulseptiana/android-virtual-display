@@ -192,6 +192,7 @@ Environment variables:
 | `VD_OUTPUT` | which monitor to duplicate | `0` |
 | `VD_VIDEO_SIZE` | stream size, `WxH` — the stream is downscaled to fit | `1280x800` |
 | `VD_VIDEO_FPS` | encoder target frame rate | `30` |
+| `VD_VIDEO_BITRATE` | encoder target bitrate, bits per second | `8000000` |
 | `VD_CODEC` | `jpeg` forces the fallback codec | H.264 |
 | `VD_ENCODER` | `software` forces the software encoder, or a name substring such as `dx12` | hardware first |
 | `VD_ENCODER_CHECK` | encode 30 synthetic frames, print the result and exit (a diagnostic) | off |
