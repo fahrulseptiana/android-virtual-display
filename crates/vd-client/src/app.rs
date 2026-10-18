@@ -83,9 +83,6 @@ pub struct VdClientApp {
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
     frames_seen: u64,
-    measured_fps: f32,
-    /// The host currently connected to, for the stream overlay.
-    streaming_host: Option<String>,
 }
 
 impl VdClientApp {
@@ -104,8 +101,6 @@ impl VdClientApp {
             frames: FrameQueue::new(),
             texture: None,
             frames_seen: 0,
-            measured_fps: 0.0,
-            streaming_host: None,
         };
 
         match Browser::bind(DiscoveryConfig::default()) {
@@ -163,7 +158,6 @@ impl VdClientApp {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
                 ConnectionEvent::PairingRequired { host, pin } => Connection::Pairing { host, pin },
                 ConnectionEvent::Established(session) => {
-                    self.streaming_host = Some(session.host.name.clone());
                     // Straight to full screen once the session is up.
                     self.view = View::Stream;
                     Connection::Connected { session }
@@ -209,7 +203,6 @@ impl VdClientApp {
         }
         self.handle = None;
         self.connection = Connection::Idle;
-        self.streaming_host = None;
         self.view = View::Browser;
         self.frames.clear();
         self.texture = None;
@@ -230,11 +223,6 @@ impl VdClientApp {
         ));
     }
 
-    /// Frames per second, measured over the last reporting window.
-    fn fps(&self) -> f32 {
-        self.measured_fps
-    }
-
     fn report_rates(&mut self) {
         static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
         let last = LAST.get_or_init(|| std::sync::Mutex::new(Instant::now()));
@@ -243,10 +231,9 @@ impl VdClientApp {
             return;
         }
         let seconds = last.elapsed().as_secs_f32();
-        self.measured_fps = self.frames_seen as f32 / seconds;
         log::info!(
             "rates: {:.1} frames/s drawn, {} queued",
-            self.measured_fps,
+            self.frames_seen as f32 / seconds,
             self.frames.len()
         );
         self.frames_seen = 0;
@@ -414,14 +401,6 @@ impl VdClientApp {
                 );
             }
         }
-
-        stream_overlay(
-            ui,
-            rect,
-            self.streaming_host.as_deref(),
-            self.fps(),
-            &self.connection,
-        );
     }
 }
 
@@ -558,34 +537,6 @@ fn status_line(ui: &mut egui::Ui, connection: &Connection) {
             ui.colored_label(ui.visuals().error_fg_color, format!("{host}: {reason}"));
         }
     }
-}
-
-/// Host name, frame rate and a way back, drawn over the video.
-fn stream_overlay(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    host: Option<&str>,
-    fps: f32,
-    connection: &Connection,
-) {
-    let text = match (host, connection) {
-        (Some(host), _) => format!("{host} · {fps:.0} fps · back to exit"),
-        (None, _) => "back to exit".to_owned(),
-    };
-
-    let padding = egui::vec2(10.0, 4.0);
-    let galley = ui.painter().layout_no_wrap(
-        text,
-        egui::FontId::proportional(13.0),
-        egui::Color32::from_gray(220),
-    );
-    let origin = rect.left_top() + egui::vec2(12.0, 12.0);
-    let banner = egui::Rect::from_min_size(origin, galley.size() + padding * 2.0);
-
-    ui.painter()
-        .rect_filled(banner, 6.0, egui::Color32::from_black_alpha(160));
-    ui.painter()
-        .galley(origin + padding, galley, egui::Color32::WHITE);
 }
 
 fn reject_text(reason: RejectReason) -> String {
