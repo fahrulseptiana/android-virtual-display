@@ -20,6 +20,7 @@
 
 pub mod frame;
 pub mod handshake;
+pub mod heartbeat;
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +141,10 @@ pub enum SessionMessage {
     },
     /// Host → client: refuses the session.
     Reject { reason: RejectReason },
+    /// Either side: liveness probe once the session is established.
+    Ping,
+    /// Reply to a [`SessionMessage::Ping`].
+    Pong,
 }
 
 impl SessionMessage {
@@ -165,7 +170,7 @@ impl SessionMessage {
     pub fn protocol(&self) -> Option<u16> {
         match self {
             Self::Hello { protocol, .. } | Self::Welcome { protocol, .. } => Some(*protocol),
-            Self::Reject { .. } => None,
+            Self::Reject { .. } | Self::Ping | Self::Pong => None,
         }
     }
 }

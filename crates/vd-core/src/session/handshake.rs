@@ -130,7 +130,9 @@ impl ClientHandshake {
                 self.state = State::Failed;
                 Ok(Action::Rejected(reason))
             }
-            SessionMessage::Hello { .. } => Err(Error::Protocol("host sent a hello to a client")),
+            SessionMessage::Hello { .. } | SessionMessage::Ping | SessionMessage::Pong => {
+                Err(Error::Protocol("host sent a client-only message"))
+            }
         }
     }
 }
@@ -203,9 +205,10 @@ impl HostHandshake {
                     self.capabilities.clone(),
                 )))
             }
-            SessionMessage::Welcome { .. } | SessionMessage::Reject { .. } => {
-                Err(Error::Protocol("client sent a host-only message"))
-            }
+            SessionMessage::Welcome { .. }
+            | SessionMessage::Reject { .. }
+            | SessionMessage::Ping
+            | SessionMessage::Pong => Err(Error::Protocol("client sent a host-only message")),
         }
     }
 }
