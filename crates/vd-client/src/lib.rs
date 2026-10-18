@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod connection;
+pub mod frames;
 pub mod logging;
 
 pub const APP_NAME: &str = "VD Client";

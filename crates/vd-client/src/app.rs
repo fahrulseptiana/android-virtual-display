@@ -1,21 +1,22 @@
-//! The client UI: discover hosts on the local network and open a control
-//! connection to one of them.
+//! The client UI: discover hosts, pair, and show the incoming video.
 
 use std::net::SocketAddr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui::load::SizedTexture;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
 use vd_core::{HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
+use crate::frames::LatestFrame;
 
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
-/// How often egui should repaint even without input (keeps the list fresh).
-const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+/// How often egui should repaint even without input (keeps video smooth).
+const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
 /// State of the control connection.
 enum Connection {
@@ -48,7 +49,7 @@ impl Connection {
     }
 }
 
-/// eframe application showing the discovered hosts.
+/// eframe application showing the discovered hosts and the video stream.
 pub struct VdClientApp {
     browser: Option<Browser>,
     browser_error: Option<String>,
@@ -58,6 +59,12 @@ pub struct VdClientApp {
     connection: Connection,
     /// The live connection, used to answer pairing requests.
     handle: Option<ConnectionHandle>,
+    /// Newest decoded frame, written by the connection worker.
+    frames: LatestFrame,
+    texture: Option<egui::TextureHandle>,
+    uploaded_sequence: Option<u64>,
+    frames_seen: u64,
+    first_frame_at: Option<Instant>,
 }
 
 impl VdClientApp {
@@ -72,6 +79,11 @@ impl VdClientApp {
             events_rx,
             connection: Connection::Idle,
             handle: None,
+            frames: LatestFrame::new(),
+            texture: None,
+            uploaded_sequence: None,
+            frames_seen: 0,
+            first_frame_at: None,
         };
 
         match Browser::bind(DiscoveryConfig::default()) {
@@ -128,7 +140,11 @@ impl VdClientApp {
             self.connection = match event {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
                 ConnectionEvent::PairingRequired { host, pin } => Connection::Pairing { host, pin },
-                ConnectionEvent::Established(session) => Connection::Connected { session },
+                ConnectionEvent::Established(session) => {
+                    self.first_frame_at = Some(Instant::now());
+                    self.frames_seen = 0;
+                    Connection::Connected { session }
+                }
                 ConnectionEvent::Rejected { host, reason } => Connection::Failed {
                     host,
                     reason: reject_text(reason),
@@ -143,6 +159,29 @@ impl VdClientApp {
         }
     }
 
+    /// Uploads the newest frame as a texture, if it is newer than the last one.
+    fn refresh_texture(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self.frames.latest() else {
+            return;
+        };
+        if self.uploaded_sequence == Some(frame.sequence) {
+            return;
+        }
+
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.pixels,
+        );
+        match &mut self.texture {
+            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                self.texture = Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        self.uploaded_sequence = Some(frame.sequence);
+        self.frames_seen += 1;
+    }
+
     fn scan_now(&mut self) {
         if let Some(browser) = self.browser.as_mut() {
             // Errors are non-fatal: we simply try again on the next tick.
@@ -155,7 +194,30 @@ impl VdClientApp {
             host: host.name.clone(),
             note: None,
         };
-        self.handle = Some(connection::connect(addr, host, self.events_tx.clone()));
+        self.frames.clear();
+        self.texture = None;
+        self.uploaded_sequence = None;
+        self.handle = Some(connection::connect(
+            addr,
+            host,
+            self.events_tx.clone(),
+            self.frames.clone(),
+        ));
+    }
+
+    /// Frames per second since the session was established.
+    fn fps(&self) -> f32 {
+        match self.first_frame_at {
+            Some(start) => {
+                let seconds = start.elapsed().as_secs_f32();
+                if seconds > 0.0 {
+                    self.frames_seen as f32 / seconds
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        }
     }
 }
 
@@ -169,6 +231,7 @@ impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_discovery();
         self.poll_connection();
+        self.refresh_texture(ui.ctx());
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
 
         let now = Instant::now();
@@ -180,7 +243,9 @@ impl eframe::App for VdClientApp {
         hosts.sort_by(|a, b| a.info.name.cmp(&b.info.name));
 
         let connection = &self.connection;
+        let texture = self.texture.as_ref();
         let connect_enabled = !connection.is_busy();
+        let fps = self.fps();
         let mut scan_requested = false;
         let mut connect_to: Option<(SocketAddr, HostInfo)> = None;
         let mut pairing_decision: Option<bool> = None;
@@ -191,7 +256,12 @@ impl eframe::App for VdClientApp {
             ui.label("Hosts on your local network");
 
             ui.add_space(8.0);
-            connection_status(ui, connection);
+            connection_status(ui, connection, fps);
+
+            if let Some(texture) = texture {
+                ui.add_space(8.0);
+                show_video(ui, texture);
+            }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -276,7 +346,20 @@ impl eframe::App for VdClientApp {
     }
 }
 
-fn connection_status(ui: &mut egui::Ui, connection: &Connection) {
+/// Draws the video, fitted to the space available for it.
+fn show_video(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
+    let video = texture.size_vec2();
+    // Keep room for the status card and the host list below.
+    let available = egui::vec2(ui.available_width(), ui.available_height() * 0.65);
+    let scale = (available.x / video.x).min(available.y / video.y);
+    let size = video * scale.clamp(0.05, 1.0);
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.add(egui::Image::new(SizedTexture::new(texture.id(), size)));
+    });
+}
+
+fn connection_status(ui: &mut egui::Ui, connection: &Connection, fps: f32) {
     egui::Frame::group(ui.style()).show(ui, |ui| match connection {
         Connection::Idle => {
             ui.label("Not connected");
@@ -303,7 +386,7 @@ fn connection_status(ui: &mut egui::Ui, connection: &Connection) {
                 format!("Connected to {}", session.host.name),
             );
             ui.label(format!(
-                "protocol v{} · codec {}",
+                "protocol v{} · codec {} · {fps:.1} fps",
                 session.protocol,
                 session
                     .codec

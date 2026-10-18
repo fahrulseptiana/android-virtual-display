@@ -1,17 +1,18 @@
-//! Headless end-to-end probe: discover a host, open a control session and keep
-//! it alive (watch heartbeats and reconnection happen).
+//! Headless end-to-end probe: discover a host, pair, and report the video stream.
 //!
 //! ```text
 //! cargo run -p vd-client --example connect           # hold for 10s
 //! VD_HOLD=30 cargo run -p vd-client --example connect
 //! ```
 //!
-//! Useful for verifying the control channel without a GUI or a device.
+//! Useful for verifying the whole pipeline without a GUI: it prints how many
+//! frames arrive and at what rate.
 
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use vd_client::connection::{self, ConnectionEvent};
+use vd_client::frames::LatestFrame;
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,11 +52,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (events_tx, events_rx) = channel();
-    let handle = connection::connect(host.control_addr(), host.info.clone(), events_tx);
+    let frames = LatestFrame::new();
+    let handle = connection::connect(
+        host.control_addr(),
+        host.info.clone(),
+        events_tx,
+        frames.clone(),
+    );
 
     let deadline = Instant::now() + hold;
+    let mut last_sequence = None;
+    let mut received = 0u64;
+
     while Instant::now() < deadline {
-        match events_rx.recv_timeout(Duration::from_millis(250)) {
+        match events_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ConnectionEvent::PairingRequired { host, pin }) => {
                 println!("  pairing with {host} — PIN {pin:06} (auto-approving)");
                 handle.decide_pairing(true);
@@ -64,7 +74,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+
+        if let Some(frame) = frames.latest() {
+            if last_sequence != Some(frame.sequence) {
+                last_sequence = Some(frame.sequence);
+                received += 1;
+                if received % 30 == 1 {
+                    println!(
+                        "  frame #{}: {}x{} ({} bytes decoded)",
+                        frame.sequence,
+                        frame.width,
+                        frame.height,
+                        frame.pixels.len()
+                    );
+                }
+            }
+        }
     }
 
+    println!("received ~{received} distinct frames");
     Ok(())
 }

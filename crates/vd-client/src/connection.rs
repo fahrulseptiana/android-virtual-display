@@ -16,14 +16,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
+use vd_core::codec::decode_rgba;
 use vd_core::session::channel::{Channel, Frame};
 use vd_core::session::cipher::{Role, SessionCipher};
 use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, ClientHandshake};
+use vd_core::video::VideoFrame;
 use vd_core::{
     Capabilities, ClientInfo, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities, Platform,
     RejectReason, Session, SessionMessage, VideoCodec,
 };
+
+use crate::frames::{DecodedFrame, LatestFrame};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,9 +72,10 @@ pub fn connect(
     addr: SocketAddr,
     host: HostInfo,
     events: Sender<ConnectionEvent>,
+    frames: LatestFrame,
 ) -> ConnectionHandle {
     let (decisions_tx, decisions_rx) = channel();
-    thread::spawn(move || supervise(addr, host, events, decisions_rx));
+    thread::spawn(move || supervise(addr, host, events, decisions_rx, frames));
     ConnectionHandle {
         decisions: decisions_tx,
     }
@@ -83,6 +88,7 @@ fn supervise(
     host: HostInfo,
     events: Sender<ConnectionEvent>,
     decisions: Receiver<bool>,
+    frames: LatestFrame,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut previous_error: Option<String> = None;
@@ -99,7 +105,7 @@ fn supervise(
             return; // the UI is gone
         }
 
-        match attempt(addr, &host.name, &events, &decisions) {
+        match attempt(addr, &host.name, &events, &decisions, &frames) {
             Attempt::Disconnected(error) => {
                 // We had a session, so retry promptly.
                 warn!("session with {} ended: {error}", host.name);
@@ -158,7 +164,9 @@ fn attempt(
     host_name: &str,
     events: &Sender<ConnectionEvent>,
     decisions: &Receiver<bool>,
+    frames: &LatestFrame,
 ) -> Attempt {
+    frames.clear();
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(err) => return Attempt::Failed(format!("could not connect: {err}")),
@@ -194,18 +202,24 @@ fn attempt(
                         Ok(None) => break,
                         Err(err) => return Attempt::Disconnected(err.to_string()),
                     };
-                    let message = match channel.decode(&payload) {
-                        Ok(Frame::Control(message)) => message,
-                        // The host only sends video once the stream is wired up.
-                        Ok(Frame::Video(_)) => continue,
+                    let frame = match channel.decode(&payload) {
+                        Ok(frame) => frame,
                         Err(err) => return Attempt::Disconnected(err.to_string()),
                     };
 
                     if let Some(beat) = heartbeat.as_mut() {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
+                        if let Frame::Video(video) = frame {
+                            publish_frame(frames, &video);
+                        }
+                        // Post-handshake control messages (pongs) need no action.
                         continue;
                     }
+
+                    let Frame::Control(message) = frame else {
+                        return Attempt::Disconnected("video before the handshake".to_owned());
+                    };
 
                     let action = match handshake.on_message(message) {
                         Ok(action) => action,
@@ -323,6 +337,19 @@ fn confirm_pairing(
             None
         }
         Err(_) => None, // the UI is gone
+    }
+}
+
+/// Decodes a received frame into the UI mailbox, dropping it on failure.
+fn publish_frame(frames: &LatestFrame, video: &VideoFrame) {
+    match decode_rgba(video) {
+        Ok(image) => frames.publish(DecodedFrame {
+            sequence: video.header.sequence,
+            width: image.width,
+            height: image.height,
+            pixels: image.pixels,
+        }),
+        Err(err) => warn!("could not decode a video frame: {err}"),
     }
 }
 
