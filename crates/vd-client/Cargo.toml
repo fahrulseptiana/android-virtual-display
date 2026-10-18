@@ -1,0 +1,37 @@
+[package]
+name = "vd-client"
+description = "Android client (and desktop harness) for the Android Virtual Display project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+name = "vd_client"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "vd-client"
+path = "src/main.rs"
+
+[dependencies]
+vd-core.workspace = true
+log.workspace = true
+eframe.workspace = true
+winit.workspace = true
+
+# On Android the app uses the `NativeActivity` glue (no Java/Kotlin needed).
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "android-native-activity",
+] }
+winit = { version = "0.30", default-features = false, features = [
+    "android-native-activity",
+] }
+android_logger = "0.15"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.11"
