@@ -1,19 +1,28 @@
 //! Control-channel handshake.
 //!
-//! Pure, message-level state machines for both sides of the handshake. They
-//! never touch a socket: they consume and produce [`SessionMessage`]s, so they
-//! can be driven by any transport (and unit tested trivially).
+//! Pure, message-level state machines for both sides. They never touch a
+//! socket: they consume and produce [`SessionMessage`]s, so any transport can
+//! drive them and tests need no network.
 //!
 //! ```text
-//!   ClientHandshake                       HostHandshake
-//!     │ hello() ── Hello ─────────────────────▶ on_message()
-//!     │                                        Reply(Welcome)
-//!     │ on_message(Welcome)                    state == Established
-//!     │ Established(Session)                   session() == Some(..)
+//!   ClientHandshake                         HostHandshake
+//!     │ hello() ── Hello { client_public } ────▶ on_message()
+//!     │                                          derives keys
+//!     │  on_message(Welcome { host_public,   ◀── Reply(Welcome)
+//!     │             salt, tag })
+//!     │  derives keys, verifies the host tag
+//!     │  AwaitingConfirmation { pin }           state == Established
+//!     │  confirm()  (the user approves the PIN)
+//!     │  Established(Session)                   session() == Some(..)
 //! ```
+//!
+//! The host auto-approves: it establishes the session as soon as it receives a
+//! valid `Hello`. Only the client asks its user to confirm, via
+//! [`ClientHandshake::confirm`].
 
 use crate::error::{Error, Result};
 use crate::protocol::HostInfo;
+use crate::session::pairing::{self, EphemeralKey, PairingKeys};
 use crate::session::{
     Capabilities, ClientInfo, RejectReason, SessionMessage, VideoCodec, SESSION_PROTOCOL_VERSION,
 };
@@ -31,6 +40,8 @@ pub struct Session {
     pub codec: Option<VideoCodec>,
     /// The intersection of both peers' capabilities.
     pub capabilities: Capabilities,
+    /// Session key and PIN agreed during pairing.
+    pub keys: PairingKeys,
 }
 
 /// Lifecycle position of a handshake.
@@ -38,7 +49,7 @@ pub struct Session {
 pub enum State {
     /// Nothing exchanged yet.
     Starting,
-    /// A message was sent/received; awaiting the peer.
+    /// A message was sent/received; awaiting the peer or the user.
     Awaiting,
     /// Handshake succeeded.
     Established,
@@ -49,9 +60,13 @@ pub enum State {
 /// What the caller should do after feeding a message to a handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Send this message. Afterwards check [`state`](ClientHandshake::state):
-    /// [`State::Established`] means the peer was accepted.
+    /// Send this message. Afterwards check the state: [`State::Established`]
+    /// means the peer was accepted.
     Reply(SessionMessage),
+    /// The client must ask its user to confirm the PIN. Call
+    /// [`ClientHandshake::confirm`] once they approve (or drop the connection
+    /// if they don't).
+    AwaitingConfirmation { pin: u32 },
     /// The handshake completed on this side; the session may start.
     Established(Session),
     /// The peer or the local side rejected the session.
@@ -61,24 +76,39 @@ pub enum Action {
 /// Client half of the handshake.
 #[derive(Debug)]
 pub struct ClientHandshake {
+    key: EphemeralKey,
     hello: SessionMessage,
     client: ClientInfo,
     capabilities: Capabilities,
+    pending: Option<Pending>,
     state: State,
     session: Option<Session>,
 }
 
+/// Everything derived from a `Welcome`, held until the user confirms.
+#[derive(Debug)]
+struct Pending {
+    protocol: u16,
+    host: HostInfo,
+    agreed: Capabilities,
+    keys: PairingKeys,
+}
+
 impl ClientHandshake {
-    /// Prepares a handshake; send [`hello`](Self::hello) to begin.
-    pub fn new(client: ClientInfo, capabilities: Capabilities) -> Self {
-        let hello = SessionMessage::hello(client.clone(), capabilities.clone());
-        Self {
+    /// Prepares a handshake, generating an ephemeral key. Send
+    /// [`hello`](Self::hello) to begin.
+    pub fn new(client: ClientInfo, capabilities: Capabilities) -> Result<Self> {
+        let key = EphemeralKey::generate()?;
+        let hello = SessionMessage::hello(client.clone(), capabilities.clone(), key.public());
+        Ok(Self {
+            key,
             hello,
             client,
             capabilities,
+            pending: None,
             state: State::Starting,
             session: None,
-        }
+        })
     }
 
     /// The first message to send to the host.
@@ -97,6 +127,9 @@ impl ClientHandshake {
     }
 
     /// Feeds a message from the host.
+    ///
+    /// On a valid `Welcome` this returns [`Action::AwaitingConfirmation`]; the
+    /// caller must then ask the user and call [`confirm`](Self::confirm).
     pub fn on_message(&mut self, message: SessionMessage) -> Result<Action> {
         if self.state != State::Starting {
             return Err(Error::Protocol("client handshake out of order"));
@@ -107,6 +140,9 @@ impl ClientHandshake {
                 protocol,
                 host,
                 capabilities,
+                host_public,
+                salt,
+                tag,
             } => {
                 if protocol == 0 || protocol > SESSION_PROTOCOL_VERSION {
                     return Err(Error::UnsupportedVersion {
@@ -114,17 +150,25 @@ impl ClientHandshake {
                         local: SESSION_PROTOCOL_VERSION,
                     });
                 }
-                let capabilities = self.capabilities.intersect(&capabilities);
-                let session = Session {
-                    protocol: protocol.min(SESSION_PROTOCOL_VERSION),
+
+                let shared = self.key.shared_secret(&host_public);
+                let keys = PairingKeys::derive(&shared, &salt);
+                let transcript =
+                    pairing::transcript(protocol, &self.key.public(), &host_public, &salt);
+                if !keys.verify_tag(&transcript, &tag) {
+                    self.state = State::Failed;
+                    return Ok(Action::Rejected(RejectReason::Unauthorized));
+                }
+
+                let pin = keys.pin;
+                self.pending = Some(Pending {
+                    protocol,
                     host,
-                    client: self.client.clone(),
-                    codec: capabilities.codecs.first().copied(),
-                    capabilities,
-                };
-                self.state = State::Established;
-                self.session = Some(session.clone());
-                Ok(Action::Established(session))
+                    agreed: self.capabilities.intersect(&capabilities),
+                    keys,
+                });
+                self.state = State::Awaiting;
+                Ok(Action::AwaitingConfirmation { pin })
             }
             SessionMessage::Reject { reason } => {
                 self.state = State::Failed;
@@ -134,6 +178,29 @@ impl ClientHandshake {
                 Err(Error::Protocol("host sent a client-only message"))
             }
         }
+    }
+
+    /// Confirms the pairing after the user approved the PIN.
+    pub fn confirm(&mut self) -> Result<Action> {
+        if self.state != State::Awaiting {
+            return Err(Error::Protocol("nothing to confirm"));
+        }
+        let pending = self
+            .pending
+            .take()
+            .ok_or(Error::Protocol("nothing to confirm"))?;
+
+        let session = Session {
+            protocol: pending.protocol.min(SESSION_PROTOCOL_VERSION),
+            host: pending.host,
+            client: self.client.clone(),
+            codec: pending.agreed.codecs.first().copied(),
+            capabilities: pending.agreed,
+            keys: pending.keys,
+        };
+        self.state = State::Established;
+        self.session = Some(session.clone());
+        Ok(Action::Established(session))
     }
 }
 
@@ -169,10 +236,9 @@ impl HostHandshake {
 
     /// Feeds a message from the client.
     ///
-    /// On success returns [`Action::Reply`] carrying the `Welcome`; the session
-    /// is then available from [`session`](Self::session). On a version mismatch
-    /// it returns [`Action::Reply`] carrying a `Reject` and moves to
-    /// [`State::Failed`].
+    /// The host auto-approves: a valid `Hello` is answered with a `Welcome`
+    /// carrying the host's ephemeral key and a key-confirmation tag, and the
+    /// session is established immediately.
     pub fn on_message(&mut self, message: SessionMessage) -> Result<Action> {
         if self.state != State::Awaiting {
             return Err(Error::Protocol("host handshake out of order"));
@@ -183,6 +249,7 @@ impl HostHandshake {
                 protocol,
                 client,
                 capabilities,
+                client_public,
             } => {
                 if protocol == 0 || protocol > SESSION_PROTOCOL_VERSION {
                     self.state = State::Failed;
@@ -191,6 +258,14 @@ impl HostHandshake {
                     }));
                 }
 
+                let key = EphemeralKey::generate()?;
+                let salt = pairing::generate_salt()?;
+                let shared = key.shared_secret(&client_public);
+                let keys = PairingKeys::derive(&shared, &salt);
+                let transcript =
+                    pairing::transcript(protocol, &client_public, &key.public(), &salt);
+                let tag = keys.confirm_tag(&transcript);
+
                 let agreed = self.capabilities.intersect(&capabilities);
                 self.session = Some(Session {
                     protocol: protocol.min(SESSION_PROTOCOL_VERSION),
@@ -198,11 +273,16 @@ impl HostHandshake {
                     client,
                     codec: agreed.codecs.first().copied(),
                     capabilities: agreed,
+                    keys,
                 });
                 self.state = State::Established;
+
                 Ok(Action::Reply(SessionMessage::welcome(
                     self.host.clone(),
                     self.capabilities.clone(),
+                    key.public(),
+                    salt,
+                    tag,
                 )))
             }
             SessionMessage::Welcome { .. }
@@ -217,6 +297,7 @@ impl HostHandshake {
 mod tests {
     use super::*;
     use crate::protocol::{HostId, Platform};
+    use crate::session::pairing::KEY_LEN;
     use crate::session::InputCapabilities;
 
     fn host_info() -> HostInfo {
@@ -244,29 +325,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn happy_path_agrees_on_a_session() {
-        let mut host = HostHandshake::new(host_info(), capabilities(&[VideoCodec::H264], 60));
-        let mut client = ClientHandshake::new(client_info(), capabilities(&[VideoCodec::H264], 30));
-
+    /// Drives a host to accept the client's hello, returning the reply and the
+    /// host's session.
+    fn accept(host: &mut HostHandshake, client: &ClientHandshake) -> (SessionMessage, Session) {
         let Action::Reply(reply) = host.on_message(client.hello()).unwrap() else {
             panic!("host should reply to a valid hello");
         };
-        assert_eq!(host.state(), State::Established);
+        (reply, host.session().unwrap().clone())
+    }
 
-        let Action::Established(session) = client.on_message(reply).unwrap() else {
-            panic!("client should establish the session");
+    #[test]
+    fn happy_path_agrees_on_a_session_and_key() {
+        let mut host = HostHandshake::new(host_info(), capabilities(&[VideoCodec::H264], 60));
+        let mut client =
+            ClientHandshake::new(client_info(), capabilities(&[VideoCodec::H264], 30)).unwrap();
+
+        let (reply, host_session) = accept(&mut host, &client);
+
+        let Action::AwaitingConfirmation { pin } = client.on_message(reply).unwrap() else {
+            panic!("client should await confirmation");
+        };
+        assert_eq!(pin, host_session.keys.pin);
+        assert!(pin < crate::session::pairing::PIN_MODULUS);
+
+        let Action::Established(session) = client.confirm().unwrap() else {
+            panic!("client should establish after confirming");
         };
         assert_eq!(client.state(), State::Established);
 
+        // Both sides derived the same session key.
+        assert_eq!(session.keys.key, host_session.keys.key);
         assert_eq!(session.host, host_info());
         assert_eq!(session.client, client_info());
         assert_eq!(session.protocol, SESSION_PROTOCOL_VERSION);
         assert_eq!(session.codec, Some(VideoCodec::H264));
         // Intersection: the smaller fps wins.
         assert_eq!(session.capabilities.max_fps, 30);
-        // Both sides computed the same session.
-        assert_eq!(&session, host.session().unwrap());
     }
 
     #[test]
@@ -275,19 +369,52 @@ mod tests {
             host_info(),
             capabilities(&[VideoCodec::H264, VideoCodec::Av1], 60),
         );
-        // Client prefers HEVC, then H.264; host has H.264 and AV1.
         let mut client = ClientHandshake::new(
             client_info(),
             capabilities(&[VideoCodec::Hevc, VideoCodec::H264], 60),
-        );
+        )
+        .unwrap();
 
-        let Action::Reply(reply) = host.on_message(client.hello()).unwrap() else {
-            panic!("expected welcome");
+        let (reply, _) = accept(&mut host, &client);
+        let Action::AwaitingConfirmation { .. } = client.on_message(reply).unwrap() else {
+            panic!("expected confirmation prompt");
         };
-        let Action::Established(session) = client.on_message(reply).unwrap() else {
+        let Action::Established(session) = client.confirm().unwrap() else {
             panic!("expected session");
         };
         assert_eq!(session.codec, Some(VideoCodec::H264));
+    }
+
+    #[test]
+    fn client_rejects_a_bad_host_tag() {
+        let mut host = HostHandshake::new(host_info(), capabilities(&[VideoCodec::H264], 60));
+        let mut client =
+            ClientHandshake::new(client_info(), capabilities(&[VideoCodec::H264], 60)).unwrap();
+
+        let (reply, _) = accept(&mut host, &client);
+        let SessionMessage::Welcome {
+            protocol,
+            host: host_info,
+            capabilities,
+            host_public,
+            salt,
+            ..
+        } = reply
+        else {
+            panic!("expected welcome");
+        };
+        let tampered = SessionMessage::Welcome {
+            protocol,
+            host: host_info,
+            capabilities,
+            host_public,
+            salt,
+            tag: [0u8; KEY_LEN],
+        };
+
+        let action = client.on_message(tampered).unwrap();
+        assert_eq!(action, Action::Rejected(RejectReason::Unauthorized));
+        assert_eq!(client.state(), State::Failed);
     }
 
     #[test]
@@ -297,6 +424,7 @@ mod tests {
             protocol: SESSION_PROTOCOL_VERSION + 1,
             client: client_info(),
             capabilities: Capabilities::default(),
+            client_public: [0u8; KEY_LEN],
         };
 
         let Action::Reply(SessionMessage::Reject { reason }) = host.on_message(hello).unwrap()
@@ -309,15 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn client_surfaces_a_rejection() {
-        let mut client = ClientHandshake::new(client_info(), Capabilities::default());
-        let action = client
-            .on_message(SessionMessage::Reject {
-                reason: RejectReason::Unauthorized,
-            })
-            .unwrap();
-        assert_eq!(action, Action::Rejected(RejectReason::Unauthorized));
-        assert_eq!(client.state(), State::Failed);
+    fn cannot_confirm_before_the_welcome() {
+        let mut client = ClientHandshake::new(client_info(), Capabilities::default()).unwrap();
+        assert!(client.confirm().is_err());
     }
 
     #[test]

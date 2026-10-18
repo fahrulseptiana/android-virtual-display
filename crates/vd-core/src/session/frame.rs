@@ -102,6 +102,7 @@ mod tests {
                 app_version: "0.1.0".to_owned(),
             },
             Capabilities::default(),
+            [0u8; crate::session::pairing::KEY_LEN],
         )
     }
 

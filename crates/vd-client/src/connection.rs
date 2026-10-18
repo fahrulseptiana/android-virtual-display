@@ -64,7 +64,7 @@ fn supervise(addr: SocketAddr, host: HostInfo, events: Sender<ConnectionEvent>) 
             return; // the UI is gone
         }
 
-        match attempt(addr, &events) {
+        match attempt(addr, &host.name, &events) {
             Attempt::Disconnected(error) => {
                 // We had a session, so retry promptly.
                 warn!("session with {} ended: {error}", host.name);
@@ -112,7 +112,7 @@ enum Attempt {
     Rejected(RejectReason),
 }
 
-fn attempt(addr: SocketAddr, events: &Sender<ConnectionEvent>) -> Attempt {
+fn attempt(addr: SocketAddr, host_name: &str, events: &Sender<ConnectionEvent>) -> Attempt {
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(err) => return Attempt::Failed(format!("could not connect: {err}")),
@@ -121,7 +121,10 @@ fn attempt(addr: SocketAddr, events: &Sender<ConnectionEvent>) -> Attempt {
     let _ = stream.set_read_timeout(Some(READ_POLL));
     info!("control connection to {addr} established, sending hello");
 
-    let mut handshake = ClientHandshake::new(client_info(), client_capabilities());
+    let mut handshake = match ClientHandshake::new(client_info(), client_capabilities()) {
+        Ok(handshake) => handshake,
+        Err(err) => return Attempt::Failed(format!("could not generate pairing key: {err}")),
+    };
     if let Err(err) = write_message(&mut stream, &handshake.hello()) {
         return Attempt::Failed(format!("could not send hello: {err}"));
     }
@@ -148,30 +151,43 @@ fn attempt(addr: SocketAddr, events: &Sender<ConnectionEvent>) -> Attempt {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
                     } else {
-                        match handshake.on_message(message) {
-                            Ok(Action::Established(session)) => {
-                                info!(
-                                    "session established with \"{}\" — protocol v{}, codec {}",
-                                    session.host.name,
-                                    session.protocol,
-                                    codec_name(session.codec),
-                                );
-                                heartbeat = Some(Heartbeat::new(
-                                    HEARTBEAT_INTERVAL,
-                                    HEARTBEAT_TIMEOUT,
-                                    now,
-                                ));
-                                if events
-                                    .send(ConnectionEvent::Established(Box::new(session)))
-                                    .is_err()
-                                {
-                                    return Attempt::Disconnected("ui closed".to_owned());
+                        let action = match handshake.on_message(message) {
+                            Ok(action) => action,
+                            Err(err) => return Attempt::Disconnected(err.to_string()),
+                        };
+
+                        let established = match action {
+                            Action::AwaitingConfirmation { pin } => {
+                                info!("pairing with \"{host_name}\" — PIN {pin:06}");
+                                // TODO(pairing-ui): ask the user instead of
+                                // confirming automatically.
+                                match handshake.confirm() {
+                                    Ok(Action::Established(session)) => Some(session),
+                                    Ok(_) => None,
+                                    Err(err) => return Attempt::Disconnected(err.to_string()),
                                 }
                             }
-                            Ok(Action::Rejected(reason)) => return Attempt::Rejected(reason),
+                            Action::Established(session) => Some(session),
+                            Action::Rejected(reason) => return Attempt::Rejected(reason),
                             // A client never has to reply during the handshake.
-                            Ok(Action::Reply(_)) => {}
-                            Err(err) => return Attempt::Disconnected(err.to_string()),
+                            Action::Reply(_) => None,
+                        };
+
+                        if let Some(session) = established {
+                            info!(
+                                "session established with \"{}\" — protocol v{}, codec {}",
+                                session.host.name,
+                                session.protocol,
+                                codec_name(session.codec),
+                            );
+                            heartbeat =
+                                Some(Heartbeat::new(HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, now));
+                            if events
+                                .send(ConnectionEvent::Established(Box::new(session)))
+                                .is_err()
+                            {
+                                return Attempt::Disconnected("ui closed".to_owned());
+                            }
                         }
                     }
                 }

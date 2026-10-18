@@ -26,6 +26,7 @@ pub mod pairing;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{HostInfo, Platform};
+use crate::session::pairing::{KEY_LEN, SALT_LEN};
 
 /// Version of the control-channel protocol.
 ///
@@ -128,17 +129,25 @@ pub enum RejectReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionMessage {
-    /// Client → host: opens a session, proposing a protocol version.
+    /// Client → host: opens a session, proposing a version and its ephemeral key.
     Hello {
         protocol: u16,
         client: ClientInfo,
         capabilities: Capabilities,
+        /// Client's ephemeral X25519 public key.
+        client_public: [u8; KEY_LEN],
     },
-    /// Host → client: accepts, stating its own terms.
+    /// Host → client: accepts, stating its own terms and ephemeral key.
     Welcome {
         protocol: u16,
         host: HostInfo,
         capabilities: Capabilities,
+        /// Host's ephemeral X25519 public key.
+        host_public: [u8; KEY_LEN],
+        /// Public salt for the key derivation.
+        salt: [u8; SALT_LEN],
+        /// Host key-confirmation tag over the handshake transcript.
+        tag: [u8; KEY_LEN],
     },
     /// Host → client: refuses the session.
     Reject { reason: RejectReason },
@@ -150,20 +159,34 @@ pub enum SessionMessage {
 
 impl SessionMessage {
     /// Convenience constructor for a [`SessionMessage::Hello`] at the current version.
-    pub fn hello(client: ClientInfo, capabilities: Capabilities) -> Self {
+    pub fn hello(
+        client: ClientInfo,
+        capabilities: Capabilities,
+        client_public: [u8; KEY_LEN],
+    ) -> Self {
         Self::Hello {
             protocol: SESSION_PROTOCOL_VERSION,
             client,
             capabilities,
+            client_public,
         }
     }
 
     /// Convenience constructor for a [`SessionMessage::Welcome`] at the current version.
-    pub fn welcome(host: HostInfo, capabilities: Capabilities) -> Self {
+    pub fn welcome(
+        host: HostInfo,
+        capabilities: Capabilities,
+        host_public: [u8; KEY_LEN],
+        salt: [u8; SALT_LEN],
+        tag: [u8; KEY_LEN],
+    ) -> Self {
         Self::Welcome {
             protocol: SESSION_PROTOCOL_VERSION,
             host,
             capabilities,
+            host_public,
+            salt,
+            tag,
         }
     }
 
@@ -209,7 +232,7 @@ mod tests {
 
     #[test]
     fn hello_round_trips() {
-        let message = SessionMessage::hello(client(), caps());
+        let message = SessionMessage::hello(client(), caps(), [1u8; KEY_LEN]);
         assert_eq!(message.protocol(), Some(SESSION_PROTOCOL_VERSION));
         assert_eq!(round_trip(&message), message);
     }
@@ -217,7 +240,13 @@ mod tests {
     #[test]
     fn welcome_round_trips() {
         let host = HostInfo::new(HostId::from("host-1"), "DESKTOP");
-        let message = SessionMessage::welcome(host, caps());
+        let message = SessionMessage::welcome(
+            host,
+            caps(),
+            [2u8; KEY_LEN],
+            [3u8; SALT_LEN],
+            [4u8; KEY_LEN],
+        );
         assert_eq!(round_trip(&message), message);
     }
 
@@ -233,8 +262,11 @@ mod tests {
     #[test]
     fn missing_optional_capability_fields_default() {
         // A peer may omit fields it does not know about.
-        let json = r#"{"kind":"hello","protocol":1,"client":{"name":"x"},"capabilities":{}}"#;
-        let message: SessionMessage = serde_json::from_str(json).unwrap();
+        let json = format!(
+            r#"{{"kind":"hello","protocol":1,"client":{{"name":"x"}},"capabilities":{{}},"client_public":{}}}"#,
+            serde_json::to_string(&[0u8; KEY_LEN]).unwrap()
+        );
+        let message: SessionMessage = serde_json::from_str(&json).unwrap();
         let SessionMessage::Hello { capabilities, .. } = message else {
             panic!("expected hello");
         };
