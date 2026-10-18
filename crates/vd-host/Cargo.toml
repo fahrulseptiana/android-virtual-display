@@ -1,0 +1,19 @@
+[package]
+name = "vd-host"
+description = "Windows-side host for the Android Virtual Display project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vd-host"
+path = "src/main.rs"
+
+[dependencies]
+vd-core.workspace = true
+log.workspace = true
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+ctrlc = "3"
