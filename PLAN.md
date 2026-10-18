@@ -187,7 +187,12 @@ protected, because a different key is challenged.
       Handles all three shapes Windows emits (colour, masked-colour,
       monochrome AND/XOR).
 - [ ] **Fallback:** Windows.Graphics.Capture — needed for some HDR/protected
-      cases and per-window capture.
+      cases and per-window capture. No longer *only* a fallback: per-monitor
+      duplication hands us the whole output (3840x2160 here) and we then
+      downscale it on the CPU for 23 ms a frame, which is the largest single
+      cost in the pipeline. Capturing a window at its own size would remove that
+      entirely, and WGC produces the D3D11 texture a zero-copy path wants. See
+      open question 3.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
 - [ ] Pick a monitor at runtime rather than by index; handle monitors appearing
       and disappearing.
@@ -347,7 +352,10 @@ attacking directly.
 - [ ] Quality/latency presets.
 - [ ] Clipboard sync (optional).
 - [ ] Wake-on-LAN / keep-host-awake.
-- [ ] Packaging: signed release APK, Windows installer + auto-start.
+- [ ] Packaging: signed release APK, Windows installer + auto-start. Auto-start
+      means a scheduled task in the logged-on session rather than a Windows
+      service: DXGI duplication needs the interactive session, and session 0 has
+      no desktop to duplicate. See open question 5.
 
 ---
 
@@ -433,11 +441,16 @@ the one above.
 
 ## 7. Open questions
 
-1. ~~eframe/egui overlay vs. a dedicated `SurfaceView`/`TextureView` for video?~~
-   Settled for now: egui holds 30 fps, so the overlay stays. A `Surface` remains
-   the option if CPU or power becomes the limit.
-2. QUIC vs. custom UDP+FEC for Phase 5 — decide with real measurements.
-3. Is per-window capture (WGC) worth it, or is per-monitor enough?
-4. Minimum supported Android version — currently 31 (Android 12); MediaCodec
-   async API and Vulkan make this comfortable. Revisit if we need older devices.
-5. Do we want a headless host service (Windows service) in addition to the CLI?
+1. **egui texture vs. decoding to a `Surface`** — reopened by the Phase 6
+   timings: 19-25 ms decoding and 7-9 ms of texture work per frame puts the
+   client over the whole budget on its own.
+2. ~~QUIC vs. custom UDP+FEC~~ — neither; see the transport decision in Phase 5.
+3. **Per-window capture (WGC) vs. per-monitor** — now a performance question, not
+   a feature one: per-monitor duplication is what forces the 4K→720p downscale.
+4. **Minimum supported Android version** — 31, and nothing in Phases 6-8 moves it.
+5. **Headless host service** — not as a Windows service; DXGI duplication needs
+   the interactive session. Auto-start at logon instead.
+6. **The cursor is unowned** — blocks zero-copy on the host, and input forwarding
+   needs it either way.
+7. **`LATE_AFTER_US` is tuned for 30 fps** — must follow the frame interval if the
+   stream is ever run much slower.
