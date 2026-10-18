@@ -13,6 +13,7 @@
 //! Set `RUST_LOG=debug` for verbose output and `VD_HOST_NAME=Foo` to override
 //! the advertised name.
 
+mod control;
 mod identity;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 use vd_core::discovery::{DiscoveryConfig, Responder};
-use vd_core::HostInfo;
+use vd_core::{Capabilities, HostInfo};
 
 /// How often the responder is serviced.
 const TICK: Duration = Duration::from_millis(100);
@@ -32,10 +33,15 @@ fn main() -> vd_core::Result<()> {
     let config = DiscoveryConfig::default();
     let host = HostInfo::new(identity::load_or_create_host_id(), identity::host_name());
     let mut responder = Responder::bind(config.clone(), host.clone())?;
+    let control = control::ControlServer::bind(host.clone(), host_capabilities())?;
 
     info!(
         "host \"{}\" ({}) ready — id {}, discovery udp/{}",
         host.name, host.platform, host.id, config.port
+    );
+    info!(
+        "control channel listening on tcp/{}",
+        control.local_addr()?.port()
     );
     info!("waiting for clients on the local network (Ctrl+C to stop)");
 
@@ -50,6 +56,9 @@ fn main() -> vd_core::Result<()> {
             // A single bad datagram must not take the host down.
             warn!("discovery poll failed: {err}");
         }
+        if let Err(err) = control.poll() {
+            warn!("control accept failed: {err}");
+        }
         std::thread::sleep(TICK);
     }
 
@@ -58,6 +67,12 @@ fn main() -> vd_core::Result<()> {
     }
     debug!("bye sent; shutting down");
     Ok(())
+}
+
+/// What this host can do. Video capture/encode is not implemented yet, so no
+/// codec is advertised; input forwarding is planned.
+fn host_capabilities() -> Capabilities {
+    Capabilities::default()
 }
 
 fn install_ctrlc_handler(running: Arc<AtomicBool>) {
