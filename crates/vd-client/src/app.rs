@@ -167,6 +167,7 @@ impl VdClientApp {
         if self.uploaded_sequence == Some(frame.sequence) {
             return;
         }
+        let started = std::time::Instant::now();
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
@@ -180,6 +181,14 @@ impl VdClientApp {
         }
         self.uploaded_sequence = Some(frame.sequence);
         self.frames_seen += 1;
+
+        if self.frames_seen % 30 == 0 {
+            log::info!(
+                "upload: {} frames, {:.1} ms average",
+                self.frames_seen,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     fn scan_now(&mut self) {

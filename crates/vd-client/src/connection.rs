@@ -398,23 +398,52 @@ fn handle_stream(frames: &LatestFrame, decoder: &mut Option<Decoder>, frame: Fra
         // Pongs and anything else need no action.
         Frame::Control(_) => {}
         Frame::Video(video) if video.header.format == FrameFormat::H264 => match decoder.as_mut() {
-            Some(decoder) => match decoder.decode(&video.payload, video.header.timestamp_us) {
-                Ok(images) => {
-                    for image in images {
-                        frames.publish(DecodedFrame {
-                            sequence: video.header.sequence,
-                            width: image.width,
-                            height: image.height,
-                            pixels: image.pixels,
-                        });
+            Some(decoder) => {
+                match decode_timed(decoder, &video.payload, video.header.timestamp_us) {
+                    Ok(images) => {
+                        for image in images {
+                            frames.publish(DecodedFrame {
+                                sequence: video.header.sequence,
+                                width: image.width,
+                                height: image.height,
+                                pixels: image.pixels,
+                            });
+                        }
                     }
+                    Err(err) => warn!("H.264 decode failed: {err}"),
                 }
-                Err(err) => warn!("H.264 decode failed: {err}"),
-            },
+            }
             None => report_undecodable(video.header.format),
         },
         Frame::Video(video) => publish_frame(frames, &video),
     }
+}
+
+/// Decodes one access unit, reporting the average cost every 30 frames.
+fn decode_timed(
+    decoder: &mut Decoder,
+    payload: &[u8],
+    timestamp_us: u64,
+) -> Result<Vec<vd_core::codec::RgbaImage>, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static MICROS: AtomicU64 = AtomicU64::new(0);
+
+    let started = Instant::now();
+    let result = decoder
+        .decode(payload, timestamp_us)
+        .map_err(|err| err.to_string());
+    let elapsed = started.elapsed().as_micros() as u64;
+
+    let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    let micros = MICROS.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
+    if frames % 30 == 0 {
+        info!(
+            "decode: {frames} frames, {:.1} ms average",
+            micros as f64 / frames as f64 / 1000.0
+        );
+    }
+    result
 }
 
 /// Complains about a codec we cannot decode, once.
