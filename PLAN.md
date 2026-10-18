@@ -205,16 +205,15 @@ negotiation from Phase 2.
 
 - [x] JPEG decode on the client and display through an egui texture, off the UI
       thread, with a one-slot mailbox so the display never lags the stream.
-- [ ] **Primary:** `MediaCodec` in async mode decoding H.264 to a `Surface`, so
-      frames never touch the CPU. Requires plumbing a surface down to the Rust
-      side (e.g. `SurfaceView`/`ANativeWindow`).
-- [ ] Keep the JPEG/raw path for peers that cannot do H.264.
+- [x] H.264 through MediaCodec (`vd-client::media_codec`), the NDK C API via a
+      small FFI layer. Output is requested as NV12 and converted to RGBA on the
+      CPU. Measured on the tablet: **7.8 fps**, against ~2 fps for JPEG.
+- [ ] Zero-copy output: decode to a `Surface`/`AHardwareBuffer` so frames never
+      touch the CPU (the YUV→RGBA step is the remaining CPU cost).
 - [ ] Adaptive: drop late frames rather than queueing; track decode/render
       timings for the latency budget.
 - [ ] Handle rotation, notch/cutout, and backgrounding (pause capture when the
       app is not visible).
-- [ ] Later: import the decoded `AHardwareBuffer` into `wgpu` so the video and
-      the UI share one renderer.
 
 ### Phase 7 — Input forwarding
 
@@ -289,7 +288,7 @@ Instrumentation ships from Phase 3 onward so regressions are visible.
 | **M1 — Discoverable** ✅ | Hosts show up on the device | 0–1 |
 | **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
 | **M3 — First frame** ✅ | Synthetic capture → JPEG → encrypted TCP → decode → screen | 3–6 (minimal) |
-| **M4 — Usable** | Real DXGI capture, hardware H.264, 1080p30+, < 100 ms | 3–6 |
+| **M4 — Usable** | Real DXGI capture ✅, H.264 end to end ✅ (7.8 fps), hardware encode ⚠️, 1080p30+ ✗ | 3–6 |
 | **M5 — Interactive** | Input forwarding | 7 |
 | **M6 — Native feel** | 1080p60, < 50 ms, audio, reconnect | 5–8 |
 

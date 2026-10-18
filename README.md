@@ -12,10 +12,12 @@ Two apps, one shared codebase:
 Both depend on `crates/vd-core`, which holds everything that is not
 platform specific: the wire protocol and the discovery state machines.
 
-> **Status: real desktop on the tablet.** The client discovers a host, pairs,
-> opens an encrypted session and displays the live Windows desktop, captured
-> with DXGI Desktop Duplication. The interim JPEG codec limits it to a few
-> frames per second (see PLAN.md), so hardware H.264 is the next step.
+> **Status: H.264 end to end.** The client discovers a host, pairs, opens an
+> encrypted session and displays the live Windows desktop (DXGI capture →
+> Media Foundation H.264 → MediaCodec on the tablet). Measured at ~8 fps at
+> 720p, so "usable" is not there yet: encoding still runs on the host CPU
+> because the AMD hardware encoder will not configure on this driver, and the
+> client converts YUV to RGBA on the CPU. See PLAN.md for both.
 
 Package id: `id.fahrul.vd` · min SDK 31 (Android 12) · target SDK 36.
 
@@ -128,8 +130,9 @@ when nobody is watching.
 The client decodes off the UI thread into a one-slot mailbox and uploads the
 newest frame as a texture, so the display never lags behind the stream.
 
-> The interim codec is JPEG. It is slow (a few fps at 720p) and exists only to
-> prove the pipeline; hardware H.264 is the next step.
+> H.264 is the default (Media Foundation on the host, MediaCodec on the
+> tablet); `VD_CODEC=jpeg` forces the older JPEG path, which also serves as the
+> automatic fallback when no encoder is available.
 
 ### Security note
 
@@ -226,8 +229,10 @@ The project deliberately leans on a few principles:
 - [x] Video pipeline end to end: frame protocol, capture abstraction, encoded
       frames over the encrypted channel, client render
 - [x] Real desktop capture (DXGI Desktop Duplication) with stream downscaling
-- [ ] Hardware H.264: Media Foundation encode on the host, MediaCodec decode on
+- [x] H.264 end to end: Media Foundation encode on the host, MediaCodec decode on
       the tablet ([strategy](PLAN.md#gpu-acceleration-strategy-decision-record))
+- [ ] Hardware (GPU) H.264 encode — blocked by the AMD driver's async MFT unlock
+- [ ] Zero-copy client decode (Surface / AHardwareBuffer)
 - [ ] Trust-on-first-use host identity (authenticated pairing)
 - [ ] Touch / keyboard input forwarding
 
