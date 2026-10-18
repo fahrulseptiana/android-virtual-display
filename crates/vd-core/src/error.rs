@@ -18,6 +18,10 @@ pub enum Error {
     /// A frame declared a length we refuse to buffer.
     #[error("frame too large: {len} bytes (max {max})")]
     FrameTooLarge { len: u32, max: u32 },
+
+    /// A peer sent a message that is not valid for the current state.
+    #[error("protocol violation: {0}")]
+    Protocol(&'static str),
 }
 
 /// Convenience alias used throughout the crate.

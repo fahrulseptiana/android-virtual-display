@@ -19,6 +19,7 @@
 //! fields carry defaults).
 
 pub mod frame;
+pub mod handshake;
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,30 @@ pub struct Capabilities {
     pub max_fps: u16,
     #[serde(default)]
     pub input: InputCapabilities,
+}
+
+impl Capabilities {
+    /// The largest capability set both peers can satisfy.
+    ///
+    /// Codecs keep `self`'s preference order; numeric limits take the smaller of
+    /// the two; input kinds require both sides to support them.
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            codecs: self
+                .codecs
+                .iter()
+                .filter(|codec| other.codecs.contains(codec))
+                .copied()
+                .collect(),
+            max_width: self.max_width.min(other.max_width),
+            max_height: self.max_height.min(other.max_height),
+            max_fps: self.max_fps.min(other.max_fps),
+            input: InputCapabilities {
+                pointer: self.input.pointer && other.input.pointer,
+                keyboard: self.input.keyboard && other.input.keyboard,
+            },
+        }
+    }
 }
 
 /// Identifies the connecting client in logs and, later, in pairing.
