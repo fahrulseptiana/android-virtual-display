@@ -100,6 +100,11 @@ pub struct VdClientApp {
     /// What the host says it could show, and which of those it is showing.
     displays: Vec<DisplayInfo>,
     current_display: u32,
+    /// Whether the overlay is showing.
+    ///
+    /// Tapping the picture toggles it, so the desktop can be seen unobstructed
+    /// without giving up the controls.
+    controls: bool,
     /// When to write the next latency summary to the log.
     next_latency_report: Instant,
     /// When the drawn-frame count was last reset, for the rate in that summary.
@@ -125,6 +130,7 @@ impl VdClientApp {
             latency: Latency::new(),
             displays: Vec::new(),
             current_display: 0,
+            controls: true,
             next_latency_report: Instant::now() + LATENCY_REPORT_INTERVAL,
             last_rate_report: Instant::now(),
             last_dropped: 0,
@@ -276,7 +282,10 @@ impl VdClientApp {
     /// rather than a guess here. Offered over the stream rather than before it
     /// because the host's list only arrives with the session.
     fn show_display_choice(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        if !matches!(self.connection, Connection::Connected { .. }) || self.displays.is_empty() {
+        if !self.controls
+            || !matches!(self.connection, Connection::Connected { .. })
+            || self.displays.is_empty()
+        {
             return;
         }
 
@@ -605,6 +614,15 @@ impl VdClientApp {
     /// Full-screen video.
     fn show_stream(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+
+        // A tap on the picture toggles the overlay: one tap for an unobstructed
+        // view, another to bring the controls back. Registered before the
+        // overlay is drawn so the overlay's own widgets sit on top of it and get
+        // the taps that land on them.
+        if ui.allocate_rect(rect, egui::Sense::click()).clicked() {
+            self.controls = !self.controls;
+        }
+
         ui.painter()
             .rect_filled(rect, 0.0, egui::Color32::from_rgb(0x08, 0x08, 0x0a));
 
@@ -634,7 +652,7 @@ impl VdClientApp {
 
         // How old frames are when they arrive, shown while the session is live.
         // The mean says how it feels, the p95 says how bad it gets.
-        if matches!(self.connection, Connection::Connected { .. }) {
+        if self.controls && matches!(self.connection, Connection::Connected { .. }) {
             if let Some(readout) = self.latency.latest() {
                 let text = format!(
                     "{:.0} ms · p95 {:.0}",
