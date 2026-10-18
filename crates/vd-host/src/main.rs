@@ -136,12 +136,13 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
     Box::new(TestPattern::new(width, height))
 }
 
-/// Builds the H.264 encoder factory when `VD_CODEC=h264`.
+/// Builds the H.264 encoder factory.
 ///
-/// Returns `None` for JPEG (the default until the client can decode H.264).
+/// H.264 is the default; `VD_CODEC=jpeg` forces the interim JPEG path, and a
+/// machine without a usable encoder falls back to it automatically.
 #[cfg(windows)]
 fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
-    if std::env::var("VD_CODEC").as_deref() != Ok("h264") {
+    if std::env::var("VD_CODEC").as_deref() == Ok("jpeg") {
         return None;
     }
 

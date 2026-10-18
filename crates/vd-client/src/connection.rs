@@ -24,11 +24,40 @@ use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, ClientHandshake};
 use vd_core::video::VideoFrame;
 use vd_core::{
-    Capabilities, ClientInfo, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities, Platform,
-    RejectReason, Session, SessionMessage, VideoCodec,
+    Capabilities, ClientInfo, FrameFormat, Heartbeat, HeartbeatAction, HostInfo, InputCapabilities,
+    Platform, RejectReason, Session, SessionMessage, VideoCodec,
 };
 
 use crate::frames::{DecodedFrame, LatestFrame};
+
+#[cfg(target_os = "android")]
+pub use crate::media_codec::H264Decoder;
+
+/// A hardware H.264 decoder, or a stub where there is none.
+#[cfg(target_os = "android")]
+type Decoder = H264Decoder;
+
+/// Stand-in on platforms without Android's media stack.
+#[cfg(not(target_os = "android"))]
+pub struct FallbackDecoder;
+
+#[cfg(not(target_os = "android"))]
+impl FallbackDecoder {
+    fn new(_width: u32, _height: u32, _extradata: &[u8]) -> Result<Self, String> {
+        Err("H.264 decoding is only implemented on Android".to_owned())
+    }
+
+    fn decode(
+        &mut self,
+        _au: &[u8],
+        _timestamp_us: u64,
+    ) -> Result<Vec<vd_core::codec::RgbaImage>, String> {
+        Err("H.264 decoding is only implemented on Android".to_owned())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+type Decoder = FallbackDecoder;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -190,6 +219,7 @@ fn attempt(
     let mut buffer = [0u8; READ_BUFFER];
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut heartbeat: Option<Heartbeat> = None;
+    let mut video_decoder: Option<Decoder> = None;
 
     loop {
         let now = Instant::now();
@@ -211,10 +241,7 @@ fn attempt(
                     if let Some(beat) = heartbeat.as_mut() {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
-                        if let Frame::Video(video) = frame {
-                            publish_frame(frames, &video);
-                        }
-                        // Post-handshake control messages (pongs) need no action.
+                        handle_stream(frames, &mut video_decoder, frame);
                         continue;
                     }
 
@@ -341,6 +368,64 @@ fn confirm_pairing(
     }
 }
 
+/// Handles a post-handshake message: codec configuration or a video frame.
+fn handle_stream(frames: &LatestFrame, decoder: &mut Option<Decoder>, frame: Frame) {
+    match frame {
+        Frame::Control(SessionMessage::VideoConfig {
+            format,
+            width,
+            height,
+            extradata,
+        }) => {
+            if format == FrameFormat::H264 {
+                match Decoder::new(width, height, &extradata) {
+                    Ok(created) => {
+                        info!(
+                            "H.264 decoder ready ({width}x{height}, {} byte extradata)",
+                            extradata.len()
+                        );
+                        *decoder = Some(created);
+                    }
+                    Err(err) => {
+                        warn!("could not start the H.264 decoder: {err}");
+                        *decoder = None;
+                    }
+                }
+            } else {
+                *decoder = None;
+            }
+        }
+        // Pongs and anything else need no action.
+        Frame::Control(_) => {}
+        Frame::Video(video) if video.header.format == FrameFormat::H264 => match decoder.as_mut() {
+            Some(decoder) => match decoder.decode(&video.payload, video.header.timestamp_us) {
+                Ok(images) => {
+                    for image in images {
+                        frames.publish(DecodedFrame {
+                            sequence: video.header.sequence,
+                            width: image.width,
+                            height: image.height,
+                            pixels: image.pixels,
+                        });
+                    }
+                }
+                Err(err) => warn!("H.264 decode failed: {err}"),
+            },
+            None => report_undecodable(video.header.format),
+        },
+        Frame::Video(video) => publish_frame(frames, &video),
+    }
+}
+
+/// Complains about a codec we cannot decode, once.
+fn report_undecodable(format: FrameFormat) {
+    let mut reported = UNDECODABLE.lock().unwrap();
+    if !reported.contains(&format) {
+        reported.push(format);
+        warn!("no decoder for {format:?} frames");
+    }
+}
+
 /// Decodes a received frame into the UI mailbox, dropping it on failure.
 ///
 /// A codec we cannot decode is reported once, not on every frame.
@@ -353,11 +438,8 @@ fn publish_frame(frames: &LatestFrame, video: &VideoFrame) {
             pixels: image.pixels,
         }),
         Err(err) => {
-            let mut reported = UNDECODABLE.lock().unwrap();
-            if !reported.contains(&video.header.format) {
-                reported.push(video.header.format);
-                warn!("cannot decode {:?} frames yet: {err}", video.header.format);
-            }
+            let _ = err;
+            report_undecodable(video.header.format);
         }
     }
 }

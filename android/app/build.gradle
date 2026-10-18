@@ -27,6 +27,9 @@ android {
         }
         release {
             minifyEnabled = false
+            // Signed with the debug key so a release build can be installed
+            // locally (the native library is built optimised with `--release`).
+            signingConfig = signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
