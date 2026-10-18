@@ -36,23 +36,31 @@ reasoning about it.
 ## What the run has to say
 
 The host prints every adapter and every output, and whether duplication works on
-each, which is the question the sandbox exists to answer. It answered it in the
-negative: with VDD installed the monitor is real and healthy
-(`DISPLAY\MTT1337\...`) but **no DXGI adapter reports an output for it**, so
-Desktop Duplication cannot capture a virtual display. Windows.Graphics.Capture
-becomes the backend for them — see Phase 7.
-
-Three things had to be right before the monitor appeared at all, and each cost a
-run to find:
+each. What the sandbox is good at is finding out whether a driver *installs*:
+VDD did, with no test signing, and three things had to be right before the monitor
+appeared at all. Each cost a run to find:
 
 | Step | Why |
 |---|---|
-| `vdd_settings.xml` at `C:\VirtualDisplayDriver\` | The driver reads its configuration from there, not from beside the INF. Without it the device installs, reports OK, and creates no monitor — which looks exactly like a monitor DXGI cannot see. |
+| `vdd_settings.xml` at `C:\VirtualDisplayDriver\` | The driver reads its configuration from there, not from beside the INF. Without it the device installs, reports OK, and creates no monitor -- which looks exactly like a monitor DXGI cannot see. |
 | Create the device node after `pnputil` | The INF is root-enumerated (`Root\MttVDD`). `pnputil /add-driver` only stages the package; `devcon install` creates the node. |
 | Trust the signing certificates | The INF sets `PnpLockdown=1`, and the project's own installer imports the catalog's certificates into `TrustedPublisher`. |
 
 A reboot is needed after installing, and sandbox state survives one.
 
+### What it got wrong
+
+It reported that **no DXGI adapter has an output for the virtual monitor**, and
+that was taken to mean Desktop Duplication cannot capture one. On real hardware
+the same driver's monitor is output 1 of the AMD adapter at 1920x1200 and
+duplication on it succeeds.
+
+The sandbox misled because its own display stack is virtualised: it presents a
+"Microsoft Remote Display Adapter" of its own, and the indirect output never
+reached DXGI. A nested display stack is the wrong instrument for a question about
+display topology, however convenient it is for questions about installation.
+
+## Housekeeping: killing a stale sandbox
 ## Housekeeping: killing a stale sandbox
 
 `Stop-Process` does not stop a sandbox. The VM outlives its window, keeps its
