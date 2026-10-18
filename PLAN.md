@@ -11,8 +11,8 @@ be demonstrated on real hardware.
 
 ## 1. Goal
 
-Mirror (and later extend) a Windows desktop onto an Android device over Wi-Fi,
-with input flowing back to the PC, at a latency that feels native.
+Mirror, and then genuinely *extend*, a Windows desktop onto an Android device
+over Wi-Fi, with input flowing back to the PC, at a latency that feels native.
 
 ### Success criteria
 
@@ -23,10 +23,12 @@ with input flowing back to the PC, at a latency that feels native.
 | 3 | Time from "open app" to "first frame" | < 3 s |
 | 4 | Reconnect after Wi-Fi blip | < 5 s, automatic |
 | 5 | Setup for a new device | discover → pair → stream, no config files |
+| 6 | The tablet usable as an *extended* second monitor | Windows shows a second display; windows can be dragged onto it |
 
 ### Non-goals (for now)
 
-- Multi-client broadcast (one viewer per host session).
+- Multi-client broadcast (one viewer per host session; Phase 7 step 4 needs this
+  revisited before two tablets can each have a screen).
 - macOS/Linux hosts (the transport is portable, the capture backend is not).
 - Internet/WAN traversal (LAN only; remote access is a later, separate problem).
 - Audio (planned, but after video + input are solid).
@@ -186,13 +188,13 @@ protected, because a different key is challenged.
       pointer position and bitmap and blends it into the frame before scaling.
       Handles all three shapes Windows emits (colour, masked-colour,
       monochrome AND/XOR).
-- [ ] **Fallback:** Windows.Graphics.Capture — needed for some HDR/protected
-      cases and per-window capture. No longer *only* a fallback: per-monitor
-      duplication hands us the whole output (3840x2160 here) and we then
-      downscale it on the CPU for 23 ms a frame, which is the largest single
-      cost in the pipeline. Capturing a window at its own size would remove that
-      entirely, and WGC produces the D3D11 texture a zero-copy path wants. See
-      open question 3.
+- [ ] **Windows.Graphics.Capture** — promoted from fallback by measurement, not
+      by preference. Desktop Duplication cannot see an indirect display at all:
+      with a virtual monitor installed and healthy, DXGI enumerates five
+      adapters and no output for it (Phase 7). WGC is therefore the only way to
+      capture a virtual display, and it is also wanted for HDR/protected cases
+      and per-window capture. It hands over a D3D11 texture rather than a CPU
+      buffer, which suits the zero-copy work better than duplication does.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
 - [ ] Pick a monitor at runtime rather than by index; handle monitors appearing
       and disappearing.
@@ -214,6 +216,8 @@ protected, because a different key is challenged.
       readback and the CPU downscale. Measurement in Phase 5 put that downscale
       at **23 ms of the 32 ms** the host spends per frame, which makes this the
       single largest win left in the pipeline — bigger than the whole network.
+      Extend mode (Phase 7) removes the same 23 ms a different way, by never
+      producing a 4K frame to scale, so this is only the answer while mirroring.
       ToDo: Two things have to be settled
       first, which is why it is not simply a matter of swapping the scaler:
       * the **cursor** is currently blended into the CPU BGRA buffer, and a
@@ -336,16 +340,115 @@ attacking directly.
       host to stop sending; the host drops its subscription and the capture loop
       idles. Resuming re-subscribes, which asks for a keyframe — without one the
       decoder could not pick up after the gap.
-- [ ] Software keyboard for hosts that need it (Phase 7).
+- [ ] Software keyboard for hosts that need it (Phase 8).
 
-### Phase 7 — Input forwarding
+### Phase 7 — A real second monitor (extend)
+
+Today the host duplicates a *physical* output, so the tablet can only ever show a
+copy of a screen that already exists. Extending means Windows has to believe in a
+monitor with no panel behind it, which is what the **Indirect Display Driver
+(IddCx)** model is for: a user-mode driver that reports an adapter, an EDID and a
+list of modes, after which Windows treats it as an ordinary display.
+
+We do not write that driver. The **Virtual Display Driver** already is one: MIT
+licensed, signed with a timestamped certificate that Windows accepts, IddCx 1.10,
+UMDF, and used by Sunshine, OBS and VR setups. Sunshine takes the same route,
+telling users to install a virtual display rather than shipping one. The
+alternative was an EV certificate, Microsoft attestation signing and quite
+possibly WHQL, to arrive back at something that already works.
+
+Three findings shape the phase, the first of them measured rather than assumed:
+
+1. **Desktop Duplication cannot see an indirect display.** Checked in a sandbox:
+   with VDD installed the monitor appears and is healthy
+   (`DISPLAY\MTT1337\...`), yet DXGI enumerates five adapters and **not one
+   output for it** — only the sandbox's own display has an output, on the AMD
+   adapter. So the capture backend changes for virtual displays, and
+   Windows.Graphics.Capture stops being a Phase 3 fallback and becomes the way
+   they are captured. It also hands over a D3D11 texture rather than a CPU
+   buffer, which suits the zero-copy work better than duplication does.
+2. **Extend still removes the largest cost in the project.** Per-monitor
+   duplication hands us the whole 3840x2160 output, which we downscale on the CPU
+   for 23 ms a frame. A virtual monitor can be *created at the size the tablet
+   wants*, so that downscale disappears instead of being optimised.
+3. **The dependency is an ordinary one.** VDD publishes a driver-only package --
+   an INF, a UMDF DLL and a signed catalog -- configured by an XML file listing
+   the monitors, GPU and modes to offer. Two details are load-bearing and both
+   cost a debugging session: the settings file must be at
+   `C:\VirtualDisplayDriverdd_settings.xml`, not beside the INF, or the device
+   installs and reports OK while creating no monitor at all; and the INF is
+   root-enumerated, so `pnputil` stages the package but something else — `devcon`
+   — has to create the device node.
+
+- [ ] **Step 1 — stream any display, virtual ones included.** List every output,
+      let the client pick, and let mirror versus extend fall out of which is
+      chosen. This *is* the feature: a virtual monitor is just another output.
+- [ ] **Step 2 — fit the tablet.** Offer a mode matching the client's panel, so
+      geometry is exact and nothing is letterboxed. VDD takes its mode list from
+      `vdd_settings.xml`, so this is a configuration question rather than a driver
+      one, and the client's screen size is what that file should be built from.
+- [ ] **Step 3 — capture virtual displays with Windows.Graphics.Capture.** Not a
+      fallback any more: duplication cannot see them (above). WGC takes an
+      `HMONITOR`, which the enumeration in Step 1 already provides, and yields a
+      D3D11 texture. The capture path is where the choice belongs, so
+      `FrameSource` stays the seam and the host picks a backend per display.
+- [ ] **Step 4 — wire the virtual display's own configuration.** VDD takes its
+      monitor count, GPU and mode list from `vdd_settings.xml`, so offering the
+      tablet's size is writing that file and restarting the device, not driver
+      work. It is also what makes the 23 ms downscale unnecessary rather than
+      merely faster.
+- [ ] **Step 5 — a monitor per client**, so two tablets can have a screen each.
+      Beyond the current one-viewer-per-host non-goal, so it waits on revisiting
+      that rather than on anything here.
+
+Input forwarding (Phase 8) gets easier once this exists: a virtual monitor has a
+known rectangle in the virtual desktop, so an absolute pointer maps exactly onto
+it rather than being guessed from the tablet's aspect ratio.
+
+#### Trying it without risking the desktop
+
+VDD's own notes warn about display-priority changes and black screens after GPU
+driver updates, because Windows may promote a monitor with nothing attached. That
+is a real cost to experimenting on the machine in use, so the driver is tried in a
+disposable Windows Sandbox VM instead: install it, create a monitor, run capture
+against it, and clean up nothing but the window. VDD being signed is what makes
+this work at all, since the sandbox cannot enable test signing -- it has no
+`CmDiag`, and it cannot open its own boot configuration store, both of which were
+checked rather than assumed. The tooling for it lives on the `windows-sandbox`
+branch.
+
+#### Why not our own driver
+
+Recorded because it was the obvious plan first, and the obstacle is not writing a
+driver but loading one:
+
+| | Development | Distribution |
+|---|---|---|
+| Signing | a test certificate | EV certificate, Microsoft attestation signing |
+| Also needs | test signing on, which is a boot option | reportedly WHQL for display drivers on 24H2+ and ARM64 |
+| Can be enabled where | not from inside a sandbox | not without a certificate and a Partner Center process |
+
+#### Known risks
+
+- **Windows.Graphics.Capture is a new backend**, and the only one that can see a
+  virtual display. It needs a session that is not a service, gives frames as
+  textures rather than CPU buffers, and has its own colour and cursor behaviour
+  to get right. That work is now on the critical path of the phase rather than
+  optional.
+- **We would depend on a third-party driver** for the feature to exist at all.
+  Acceptable because the licence is permissive, the project is active and the
+  alternative is a signing process; it should still be a documented dependency
+  rather than a silent one, and the host should say plainly when no virtual
+  display is available.
+
+### Phase 8 — Input forwarding
 
 - [ ] Touch → absolute pointer on the host's chosen monitor.
 - [ ] Mouse (trackpad mode) and scroll.
 - [ ] Keyboard (hardware + soft keyboard) → `SendInput` on Windows.
 - [ ] Back-pressure and ordering guarantees over the control channel.
 
-### Phase 8 — Polish
+### Phase 9 — Polish
 
 - [ ] Audio capture + `AudioTrack` playback.
 - [ ] Multi-monitor selection and per-monitor capture.
@@ -421,8 +524,9 @@ the one above.
 | **M2 — Connected** ✅ | Encrypted, paired session; no video yet | 2 |
 | **M3 — First frame** ✅ | Synthetic capture → JPEG → encrypted TCP → decode → screen | 3–6 (minimal) |
 | **M4 — Usable** ✅ | Real DXGI capture, hardware H.264 both ends, 720p30, cursor mirrored, three-state UI | 3–6 |
-| **M5 — Interactive** | Input forwarding | 7 |
-| **M6 — Native feel** | 1080p60, < 50 ms, audio, reconnect | 5–8 |
+| **M5 — Extended** | Windows treats the tablet as a second monitor | 7 |
+| **M6 — Interactive** | Input forwarding | 8 |
+| **M7 — Native feel** | 1080p60, < 50 ms, audio, packaging | 5–9 |
 
 ---
 
@@ -433,9 +537,11 @@ the one above.
 | Wi-Fi jitter / packet loss | Stutter, latency spikes | FEC + frame dropping, VBR cap, prefer 5 GHz; measure early |
 | Hardware encoder fragmentation | Device-specific bugs | Capability negotiation + software fallback |
 | DRM/protected content | Black frames | Document as unsupported; WGC is not a DRM bypass |
-| Android backgrounding kills the stream | Broken session | Foreground service + explicit lifecycle handling |
+| Android backgrounding kills the stream | Broken session | Done in Phase 6: the UI going quiet is taken as invisible and the host pauses |
+| Driver signing for a virtual monitor | Extend mode may be unreachable | Depend on an existing virtual display first; verify WHQL/attestation before promising a release |
+| A driver that refuses to load | Days lost on the wrong problem | Test-signing spike before any driver code; WDAC on this machine is a known unknown |
 | Latency creep from copies | Too slow | Zero-copy paths, budget per stage, instrumentation |
-| Scope creep (audio, multi-monitor) | Never ships | Strict phase order; polish only after M4 |
+| Scope creep (audio, per-client monitors) | Never ships | Strict phase order; polish only after M4 |
 
 ---
 
