@@ -183,8 +183,10 @@ impl ClientHandshake {
             }
             SessionMessage::Hello { .. }
             | SessionMessage::VideoConfig { .. }
-            | SessionMessage::Ping
-            | SessionMessage::Pong => Err(Error::Protocol("host sent a client-only message")),
+            | SessionMessage::Ping { .. }
+            | SessionMessage::Pong { .. } => {
+                Err(Error::Protocol("host sent a client-only message"))
+            }
         }
     }
 
@@ -317,8 +319,10 @@ impl HostHandshake {
             SessionMessage::Welcome { .. }
             | SessionMessage::Reject { .. }
             | SessionMessage::VideoConfig { .. }
-            | SessionMessage::Ping
-            | SessionMessage::Pong => Err(Error::Protocol("client sent a host-only message")),
+            | SessionMessage::Ping { .. }
+            | SessionMessage::Pong { .. } => {
+                Err(Error::Protocol("client sent a host-only message"))
+            }
         }
     }
 }

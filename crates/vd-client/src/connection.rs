@@ -31,6 +31,7 @@ use vd_core::{
 };
 
 use crate::frames::{DecodedFrame, FrameQueue};
+use crate::latency::Latency;
 use crate::trust::TrustStore;
 
 #[cfg(target_os = "android")]
@@ -74,6 +75,8 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// backoff exists only to avoid spinning while a host is down — it does not
 /// need to grow into tens of seconds.
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(500);
+/// How often the frame latency measured so far is summarised into the log.
+const LATENCY_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const READ_BUFFER: usize = 4096;
 
@@ -96,6 +99,36 @@ pub enum ConnectionEvent {
     Failed { host: String, error: String },
     /// The host refused the session — terminal, the worker stops.
     Rejected { host: String, reason: RejectReason },
+}
+
+/// Everything a worker reports through.
+///
+/// Grouped rather than passed separately because every one of them travels
+/// together from `connect` all the way down to the per-frame path.
+#[derive(Clone)]
+pub struct Sinks {
+    /// Connection state changes, for the UI.
+    events: Sender<ConnectionEvent>,
+    /// Decoded frames, for the UI.
+    frames: FrameQueue,
+    /// How long frames are taking, for the UI.
+    latency: Latency,
+}
+
+impl Sinks {
+    /// Groups the three places a worker sends its results.
+    pub fn new(events: Sender<ConnectionEvent>, frames: FrameQueue, latency: Latency) -> Self {
+        Self {
+            events,
+            frames,
+            latency,
+        }
+    }
+
+    /// Tells the UI something changed.
+    fn send(&self, event: ConnectionEvent) -> bool {
+        self.events.send(event).is_ok()
+    }
 }
 
 /// The two signals the UI can send a running worker.
@@ -140,8 +173,7 @@ impl ConnectionHandle {
 pub fn connect(
     addr: SocketAddr,
     host: HostInfo,
-    events: Sender<ConnectionEvent>,
-    frames: FrameQueue,
+    sinks: Sinks,
     trust_path: Option<std::path::PathBuf>,
 ) -> ConnectionHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -151,17 +183,7 @@ pub fn connect(
         cancelled: cancelled.clone(),
         retry: retry.clone(),
     };
-    thread::spawn(move || {
-        supervise(
-            addr,
-            host,
-            events,
-            decisions_rx,
-            frames,
-            control,
-            trust_path,
-        )
-    });
+    thread::spawn(move || supervise(addr, host, sinks, decisions_rx, control, trust_path));
     ConnectionHandle {
         decisions: decisions_tx,
         cancelled,
@@ -174,9 +196,8 @@ pub fn connect(
 fn supervise(
     addr: SocketAddr,
     host: HostInfo,
-    events: Sender<ConnectionEvent>,
+    sinks: Sinks,
     decisions: Receiver<bool>,
-    frames: FrameQueue,
     control: WorkerControl,
     trust_path: Option<std::path::PathBuf>,
 ) {
@@ -191,19 +212,14 @@ fn supervise(
             return;
         }
         debug!("connecting to {}", host.name);
-        if events
-            .send(ConnectionEvent::Connecting {
-                host: host.name.clone(),
-                note: previous_error.take(),
-            })
-            .is_err()
-        {
+        if !sinks.send(ConnectionEvent::Connecting {
+            host: host.name.clone(),
+            note: previous_error.take(),
+        }) {
             return; // the UI is gone
         }
 
-        match attempt(
-            addr, &host.name, &events, &decisions, &frames, &control, &mut trust,
-        ) {
+        match attempt(addr, &host.name, &sinks, &decisions, &control, &mut trust) {
             Attempt::Disconnected(error) => {
                 // We had a session, so try again immediately: the usual reason
                 // for losing one is that the host restarted, and it is often
@@ -228,7 +244,7 @@ fn supervise(
                 previous_error = Some(error);
             }
             Attempt::Rejected(reason) => {
-                let _ = events.send(ConnectionEvent::Rejected {
+                let _ = sinks.send(ConnectionEvent::Rejected {
                     host: host.name.clone(),
                     reason,
                 });
@@ -241,13 +257,10 @@ fn supervise(
         }
 
         let error = previous_error.clone().unwrap_or_default();
-        if events
-            .send(ConnectionEvent::Failed {
-                host: host.name.clone(),
-                error,
-            })
-            .is_err()
-        {
+        if !sinks.send(ConnectionEvent::Failed {
+            host: host.name.clone(),
+            error,
+        }) {
             return;
         }
         // Wait out the backoff, but stay responsive to a disconnect — and to
@@ -281,13 +294,12 @@ enum Attempt {
 fn attempt(
     addr: SocketAddr,
     host_name: &str,
-    events: &Sender<ConnectionEvent>,
+    sinks: &Sinks,
     decisions: &Receiver<bool>,
-    frames: &FrameQueue,
     control: &WorkerControl,
     trust: &mut TrustStore,
 ) -> Attempt {
-    frames.clear();
+    sinks.frames.clear();
     let mut stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(err) => return Attempt::Failed(format!("could not connect: {err}")),
@@ -311,7 +323,9 @@ fn attempt(
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut heartbeat: Option<Heartbeat> = None;
     // Decoding runs on its own thread so it never blocks the socket.
-    let decode_worker = DecoderWorker::spawn(frames.clone());
+    let decode_worker = DecoderWorker::spawn(sinks.frames.clone());
+    // Latency is measured in batches and reported on this cadence.
+    let mut next_latency_report = Instant::now() + LATENCY_REPORT_INTERVAL;
 
     loop {
         if control.cancelled.load(Ordering::Relaxed) {
@@ -336,7 +350,17 @@ fn attempt(
                     if let Some(beat) = heartbeat.as_mut() {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
-                        handle_stream(frames, &decode_worker, frame);
+                        if let Frame::Control(message) = &frame {
+                            if let SessionMessage::Pong {
+                                sent_us,
+                                recv_us,
+                                reply_us,
+                            } = **message
+                            {
+                                sinks.latency.observe_exchange(sent_us, recv_us, reply_us);
+                            }
+                        }
+                        handle_stream(sinks, &decode_worker, frame);
                         continue;
                     }
 
@@ -362,7 +386,7 @@ fn attempt(
                             &host_id,
                             pin,
                             identity,
-                            events,
+                            sinks,
                             decisions,
                             &mut handshake,
                             trust,
@@ -379,10 +403,7 @@ fn attempt(
                             HEARTBEAT_TIMEOUT,
                             Instant::now(),
                         ));
-                        if events
-                            .send(ConnectionEvent::Established(Box::new(session)))
-                            .is_err()
-                        {
+                        if !sinks.send(ConnectionEvent::Established(Box::new(session))) {
                             return Attempt::Cancelled;
                         }
                         continue;
@@ -406,9 +427,10 @@ fn attempt(
         match heartbeat.as_mut() {
             Some(beat) => match beat.poll(now) {
                 HeartbeatAction::SendPing => {
-                    if let Err(err) =
-                        write_message(&mut stream, &mut channel, &SessionMessage::Ping)
-                    {
+                    let ping = SessionMessage::Ping {
+                        sent_us: sinks.latency.now_us(),
+                    };
+                    if let Err(err) = write_message(&mut stream, &mut channel, &ping) {
                         return Attempt::Disconnected(format!("could not send ping: {err}"));
                     }
                 }
@@ -426,6 +448,19 @@ fn attempt(
             }
             None => {}
         }
+
+        if now >= next_latency_report {
+            next_latency_report = now + LATENCY_REPORT_INTERVAL;
+            if let Some(readout) = sinks.latency.summarise() {
+                info!(
+                    "frame latency {:.1} ms average, {:.1} ms p95, {:.1} ms worst — {} frames",
+                    readout.mean_ms(),
+                    readout.p95_ms(),
+                    readout.max_ms(),
+                    readout.samples,
+                );
+            }
+        }
     }
 }
 
@@ -438,7 +473,7 @@ fn confirm_pairing(
     host_id: &vd_core::HostId,
     pin: u32,
     identity: Option<[u8; 32]>,
-    events: &Sender<ConnectionEvent>,
+    sinks: &Sinks,
     decisions: &Receiver<bool>,
     handshake: &mut ClientHandshake,
     trust: &mut TrustStore,
@@ -462,14 +497,11 @@ fn confirm_pairing(
             );
         }
         info!("pairing with \"{host_name}\" — PIN {pin:06}");
-        if events
-            .send(ConnectionEvent::PairingRequired {
-                host: host_name.to_owned(),
-                pin,
-                identity_changed,
-            })
-            .is_err()
-        {
+        if !sinks.send(ConnectionEvent::PairingRequired {
+            host: host_name.to_owned(),
+            pin,
+            identity_changed,
+        }) {
             return None;
         }
 
@@ -520,7 +552,7 @@ fn confirm_pairing(
 /// socket for ~18 ms per frame, the TCP window would fill, the host's write
 /// would block, and the broadcaster would drop frames — which is exactly what
 /// the first version of this did.
-fn handle_stream(frames: &FrameQueue, worker: &DecoderWorker, frame: Frame) {
+fn handle_stream(sinks: &Sinks, worker: &DecoderWorker, frame: Frame) {
     match frame {
         Frame::Control(message) if matches!(*message, SessionMessage::VideoConfig { .. }) => {
             let SessionMessage::VideoConfig {
@@ -540,6 +572,9 @@ fn handle_stream(frames: &FrameQueue, worker: &DecoderWorker, frame: Frame) {
         Frame::Control(_) => {}
         Frame::Video(video) if video.header.format == FrameFormat::H264 => {
             report_wire_sequence(video.header.sequence);
+            // Stamp the age as the frame arrives: what happens to it after this
+            // is decoding and presentation, not transport.
+            sinks.latency.record(video.header.timestamp_us);
             worker.submit(
                 video.payload.clone(),
                 video.header.sequence,
@@ -547,7 +582,7 @@ fn handle_stream(frames: &FrameQueue, worker: &DecoderWorker, frame: Frame) {
             );
         }
         // Anything else (JPEG, raw) is decoded straight into the mailbox.
-        Frame::Video(video) => publish_frame(frames, &video),
+        Frame::Video(video) => publish_frame(&sinks.frames, &video),
     }
 }
 

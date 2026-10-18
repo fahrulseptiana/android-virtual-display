@@ -34,7 +34,7 @@ use crate::session::pairing::{KEY_LEN, SALT_LEN};
 ///
 /// Independent of [`crate::protocol::PROTOCOL_VERSION`], which version guards the
 /// UDP discovery datagrams.
-pub const SESSION_PROTOCOL_VERSION: u16 = 1;
+pub const SESSION_PROTOCOL_VERSION: u16 = 2;
 
 /// A video codec a peer is able to encode or decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -166,9 +166,28 @@ pub enum SessionMessage {
         extradata: Vec<u8>,
     },
     /// Either side: liveness probe once the session is established.
-    Ping,
+    ///
+    /// Carries the sender's clock so the two ends can be lined up.
+    Ping {
+        /// Sender's clock, in microseconds.
+        #[serde(default)]
+        sent_us: u64,
+    },
     /// Reply to a [`SessionMessage::Ping`].
-    Pong,
+    ///
+    /// The three readings let the sender estimate both the round-trip time and
+    /// how far its own clock sits from the host's, in the style of NTP.
+    Pong {
+        /// Echoed from the ping, so the sender knows what it is answering.
+        #[serde(default)]
+        sent_us: u64,
+        /// Host clock when the ping arrived.
+        #[serde(default)]
+        recv_us: u64,
+        /// Host clock when this reply went out.
+        #[serde(default)]
+        reply_us: u64,
+    },
 }
 
 impl SessionMessage {
@@ -210,7 +229,10 @@ impl SessionMessage {
     pub fn protocol(&self) -> Option<u16> {
         match self {
             Self::Hello { protocol, .. } | Self::Welcome { protocol, .. } => Some(*protocol),
-            Self::Reject { .. } | Self::VideoConfig { .. } | Self::Ping | Self::Pong => None,
+            Self::Reject { .. }
+            | Self::VideoConfig { .. }
+            | Self::Ping { .. }
+            | Self::Pong { .. } => None,
         }
     }
 }

@@ -5,7 +5,7 @@
 //! is deterministic apart from the animation, which makes it easy to eyeball
 //! (a coloured bar sweeps across the screen) and to test.
 
-use std::time::Instant;
+use crate::clock::Clock;
 
 use crate::video::FrameFormat;
 
@@ -21,17 +21,21 @@ pub struct TestPattern {
     width: u32,
     height: u32,
     frame: u64,
-    started: Instant,
+    clock: Clock,
 }
 
 impl TestPattern {
-    /// Creates a pattern of the given size.
-    pub fn new(width: u32, height: u32) -> Self {
+    /// Creates a pattern of the given size, stamping frames from `clock`.
+    ///
+    /// The clock is passed in rather than created here so that every source
+    /// shares the host's epoch: frame timestamps have to be comparable with the
+    /// ones the control channel hands out.
+    pub fn new(width: u32, height: u32, clock: Clock) -> Self {
         Self {
             width,
             height,
             frame: 0,
-            started: Instant::now(),
+            clock,
         }
     }
 
@@ -73,7 +77,7 @@ impl FrameSource for TestPattern {
             width: self.width,
             height: self.height,
             format: FrameFormat::RawRgba,
-            timestamp_us: self.started.elapsed().as_micros() as u64,
+            timestamp_us: self.clock.now_us(),
             data: self.render(),
         };
         self.frame = self.frame.wrapping_add(1);
@@ -87,7 +91,7 @@ mod tests {
 
     #[test]
     fn produces_rgba_frames_of_the_right_size() {
-        let mut source = TestPattern::new(64, 32);
+        let mut source = TestPattern::new(64, 32, Clock::new());
         let frame = source.next_frame().unwrap().unwrap();
 
         assert_eq!(frame.width, 64);
@@ -102,7 +106,7 @@ mod tests {
 
     #[test]
     fn animates_between_frames() {
-        let mut source = TestPattern::new(128, 64);
+        let mut source = TestPattern::new(128, 64, Clock::new());
         let first = source.next_frame().unwrap().unwrap();
         let second = source.next_frame().unwrap().unwrap();
         assert_ne!(first.data, second.data, "the bar should move");
@@ -110,7 +114,7 @@ mod tests {
 
     #[test]
     fn timestamps_advance() {
-        let mut source = TestPattern::new(8, 8);
+        let mut source = TestPattern::new(8, 8, Clock::new());
         let first = source.next_frame().unwrap().unwrap();
         let second = source.next_frame().unwrap().unwrap();
         assert!(second.timestamp_us >= first.timestamp_us);

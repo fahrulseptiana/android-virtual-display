@@ -134,10 +134,12 @@ mod tests {
     fn plaintext_channel_round_trips_a_message() {
         let mut channel = Channel::plaintext();
         assert!(!channel.is_encrypted());
-        let frame = channel.encode(&SessionMessage::Ping).unwrap();
+        let frame = channel
+            .encode(&SessionMessage::Ping { sent_us: 0 })
+            .unwrap();
         assert_eq!(
             decode(&mut channel, frame),
-            Frame::Control(Box::new(SessionMessage::Ping))
+            Frame::Control(Box::new(SessionMessage::Ping { sent_us: 0 }))
         );
     }
 
@@ -157,10 +159,10 @@ mod tests {
 
         assert!(client.is_encrypted() && host.is_encrypted());
 
-        let message = client.encode(&SessionMessage::Ping).unwrap();
+        let message = client.encode(&SessionMessage::Ping { sent_us: 0 }).unwrap();
         assert_eq!(
             decode(&mut host, message),
-            Frame::Control(Box::new(SessionMessage::Ping))
+            Frame::Control(Box::new(SessionMessage::Ping { sent_us: 0 }))
         );
 
         // The host is the one that sends video.
@@ -172,7 +174,9 @@ mod tests {
     fn encryption_hides_the_content() {
         let mut channel = Channel::plaintext();
         channel.encrypt(SessionCipher::new(&MASTER, Role::Client));
-        let frame = channel.encode(&SessionMessage::Ping).unwrap();
+        let frame = channel
+            .encode(&SessionMessage::Ping { sent_us: 0 })
+            .unwrap();
         assert!(!frame.windows(4).any(|w| w == b"ping"));
     }
 
@@ -181,7 +185,7 @@ mod tests {
         let mut sender = Channel::plaintext();
         sender.encrypt(SessionCipher::new(&MASTER, Role::Client));
         let mut plain = Channel::plaintext();
-        let frame = sender.encode(&SessionMessage::Ping).unwrap();
+        let frame = sender.encode(&SessionMessage::Ping { sent_us: 0 }).unwrap();
         assert!(plain.decode(&frame[4..]).is_err());
     }
 

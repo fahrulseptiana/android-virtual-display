@@ -14,6 +14,7 @@ use vd_core::{HostId, HostInfo, RejectReason, Session};
 
 use crate::connection::{self, ConnectionEvent, ConnectionHandle};
 use crate::frames::FrameQueue;
+use crate::latency::Latency;
 
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -90,6 +91,8 @@ pub struct VdClientApp {
     /// The host we are currently trying to reach, so discovery can tell us the
     /// moment it comes back.
     retry_target: Option<HostId>,
+    /// How long frames are taking, measured by the connection and shown here.
+    latency: Latency,
     /// Decoded frames waiting to be drawn.
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
@@ -102,6 +105,7 @@ impl VdClientApp {
         let mut app = Self {
             trust_path,
             retry_target: None,
+            latency: Latency::new(),
             view: View::Browser,
             browser: None,
             browser_error: None,
@@ -248,11 +252,14 @@ impl VdClientApp {
         // reaches nobody, because we replace the receiver wholesale.
         let (events_tx, events_rx) = channel();
         self.events_rx = Some(events_rx);
+        // A fresh measurement for a fresh connection: the clock offset from the
+        // last one means nothing now.
+        self.latency = Latency::new();
+        let sinks = connection::Sinks::new(events_tx, self.frames.clone(), self.latency.clone());
         self.handle = Some(connection::connect(
             addr,
             host,
-            events_tx,
-            self.frames.clone(),
+            sinks,
             self.trust_path.clone(),
         ));
     }
@@ -476,6 +483,35 @@ impl VdClientApp {
                     "Waiting for the first frame…",
                     egui::FontId::proportional(18.0),
                     egui::Color32::from_gray(180),
+                );
+            }
+        }
+
+        // How old frames are when they arrive, shown while the session is live.
+        // The mean says how it feels, the p95 says how bad it gets.
+        if matches!(self.connection, Connection::Connected { .. }) {
+            if let Some(readout) = self.latency.latest() {
+                let text = format!("{:.0} ms · p95 {:.0}", readout.mean_ms(), readout.p95_ms());
+                let anchor = rect.left_top() + egui::vec2(10.0, 8.0);
+                let painter = ui.painter();
+                let size = painter.layout_no_wrap(
+                    text.clone(),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+                let box_rect =
+                    egui::Rect::from_min_size(anchor, size.size()).expand2(egui::vec2(7.0, 4.0));
+                painter.rect_filled(
+                    box_rect,
+                    5.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 130),
+                );
+                painter.text(
+                    anchor,
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
                 );
             }
         }

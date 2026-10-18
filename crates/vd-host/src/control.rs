@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use vd_core::session::channel::{Channel, Frame};
@@ -23,7 +23,7 @@ use vd_core::session::cipher::{Role, SessionCipher};
 use vd_core::session::frame::FrameDecoder;
 use vd_core::session::handshake::{Action, HostHandshake};
 use vd_core::video::VideoFrame;
-use vd_core::{Capabilities, HostInfo, Session, SessionMessage};
+use vd_core::{Capabilities, Clock, HostInfo, Session, SessionMessage};
 
 use crate::video::Broadcaster;
 
@@ -42,6 +42,9 @@ pub struct ControlServer {
     video: Arc<Broadcaster>,
     /// Long-lived identity key, published in `Welcome` and used to authenticate.
     identity_secret: [u8; 32],
+    /// The same clock the capture pipeline stamps frames from, so a client can
+    /// compare the two and measure how long a frame took to arrive.
+    clock: Clock,
 }
 
 impl ControlServer {
@@ -51,6 +54,7 @@ impl ControlServer {
         capabilities: Capabilities,
         video: Arc<Broadcaster>,
         identity_secret: [u8; 32],
+        clock: Clock,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", host.control_port))?;
         // Non-blocking so the host's discovery loop is never held up.
@@ -61,6 +65,7 @@ impl ControlServer {
             capabilities,
             video,
             identity_secret,
+            clock,
         })
     }
 
@@ -78,10 +83,17 @@ impl ControlServer {
                     let capabilities = self.capabilities.clone();
                     let video = self.video.clone();
                     let identity_secret = self.identity_secret;
+                    let clock = self.clock.clone();
                     thread::spawn(move || {
-                        if let Err(err) =
-                            serve(stream, peer, host, capabilities, video, identity_secret)
-                        {
+                        if let Err(err) = serve(
+                            stream,
+                            peer,
+                            host,
+                            capabilities,
+                            video,
+                            identity_secret,
+                            clock,
+                        ) {
                             warn!("control connection from {peer} ended with error: {err}");
                         }
                     });
@@ -102,6 +114,7 @@ fn serve(
     capabilities: Capabilities,
     video: Arc<Broadcaster>,
     identity_secret: [u8; 32],
+    clock: Clock,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so the worker explicitly asks for blocking reads.
@@ -116,6 +129,7 @@ fn serve(
     let mut established = false;
     let mut video_rx: Option<Receiver<Arc<VideoFrame>>> = None;
     let mut sent_config: Option<u64> = None;
+    let mut host_timing = HostTiming::default();
 
     loop {
         // Tell the client how the stream is encoded before sending any of it,
@@ -146,21 +160,30 @@ fn serve(
         }
 
         // Flush any video the capture thread produced since the last lap.
+        //
+        // The two times recorded here are what a client's measurement cannot
+        // separate out: how long a frame waited after being captured, and how
+        // long the write itself took. A write that starts taking real time is a
+        // full TCP window, which is the thing a datagram transport would avoid.
         if let Some(receiver) = video_rx.as_ref() {
             while let Ok(frame) = receiver.try_recv() {
                 match channel.encode_video(&frame) {
                     Ok(bytes) => {
+                        let queued = clock.now_us().saturating_sub(frame.header.timestamp_us);
+                        let write_start = Instant::now();
                         if let Err(err) = stream.write_all(&bytes) {
                             if is_disconnect(&err) {
                                 return Ok(());
                             }
                             return Err(err.into());
                         }
+                        host_timing.record(queued, write_start.elapsed());
                     }
                     Err(err) => warn!("could not encode a video frame for {peer}: {err}"),
                 }
             }
         }
+        host_timing.report(&peer);
 
         let read = match stream.read(&mut buffer) {
             Ok(0) => {
@@ -196,9 +219,14 @@ fn serve(
 
             if established {
                 match message {
-                    SessionMessage::Ping => {
+                    SessionMessage::Ping { sent_us } => {
                         debug!("pong to {peer}");
-                        let frame = channel.encode(&SessionMessage::Pong)?;
+                        let pong = SessionMessage::Pong {
+                            sent_us,
+                            recv_us: clock.now_us(),
+                            reply_us: clock.now_us(),
+                        };
+                        let frame = channel.encode(&pong)?;
                         if let Err(err) = stream.write_all(&frame) {
                             if is_disconnect(&err) {
                                 return Ok(());
@@ -241,6 +269,57 @@ fn serve(
                 }
             }
         }
+    }
+}
+
+/// What a frame costs the host, measured on the host's own clock.
+///
+/// A client can measure how old a frame is when it arrives, but not how much of
+/// that was the host's doing. Recording it here lets the two be subtracted,
+/// leaving the network as the remainder. A write that starts taking real time
+/// means a full TCP window — the thing a datagram transport would avoid.
+#[derive(Default)]
+struct HostTiming {
+    frames: u64,
+    /// Capture to the moment the socket write was attempted.
+    queued_us: u64,
+    /// Time spent inside the writes themselves.
+    write_us: u64,
+    since: Option<Instant>,
+}
+
+impl HostTiming {
+    /// Adds one frame's timings.
+    fn record(&mut self, queued_us: u64, write: Duration) {
+        if self.since.is_none() {
+            self.since = Some(Instant::now());
+        }
+        self.frames += 1;
+        self.queued_us += queued_us;
+        self.write_us += write.as_micros() as u64;
+    }
+
+    /// Logs an average every few seconds, then starts a new batch.
+    fn report(&mut self, peer: &SocketAddr) {
+        let Some(since) = self.since else { return };
+        let elapsed = since.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        if self.frames > 0 {
+            let per_frame = self.frames as f64;
+            debug!(
+                "to {peer}: capture to wire {:.1} ms, write {:.1} ms per frame, {} frames in {:.1}s",
+                self.queued_us as f64 / per_frame / 1000.0,
+                self.write_us as f64 / per_frame / 1000.0,
+                self.frames,
+                elapsed.as_secs_f32(),
+            );
+        }
+        self.frames = 0;
+        self.queued_us = 0;
+        self.write_us = 0;
+        self.since = Some(Instant::now());
     }
 }
 

@@ -12,7 +12,7 @@
 //! * `DXGI_ERROR_ACCESS_LOST` — the duplication died (mode change, UAC, lock,
 //!   display switch); rebuild it and carry on.
 
-use std::time::Instant;
+use vd_core::clock::Clock;
 
 use log::{debug, info};
 use vd_core::capture::{CaptureError, CapturedFrame, FrameSource};
@@ -71,7 +71,7 @@ pub struct DxgiCapture {
     staging: Option<ID3D11Texture2D>,
     width: u32,
     height: u32,
-    started: Instant,
+    clock: Clock,
     pointer: Pointer,
 }
 
@@ -81,17 +81,19 @@ impl DxgiCapture {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         output_index: u32,
+        clock: Clock,
     ) -> Result<Self, CaptureError> {
         // SAFETY: every call below is a documented D3D/DXGI call; the returned
         // interfaces are owned for the lifetime of `self` and only used from the
         // capture thread.
-        unsafe { Self::create(device, context, output_index) }
+        unsafe { Self::create(device, context, output_index, clock) }
     }
 
     unsafe fn create(
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         output_index: u32,
+        clock: Clock,
     ) -> Result<Self, CaptureError> {
         let dxgi_device: IDXGIDevice = device
             .cast()
@@ -121,7 +123,7 @@ impl DxgiCapture {
             staging: None,
             width,
             height,
-            started: Instant::now(),
+            clock,
             pointer: Pointer::default(),
         })
     }
@@ -299,7 +301,7 @@ impl DxgiCapture {
             width: self.width,
             height: self.height,
             format: FrameFormat::RawBgra,
-            timestamp_us: self.started.elapsed().as_micros() as u64,
+            timestamp_us: self.clock.now_us(),
             data,
         })
     }

@@ -70,7 +70,10 @@ fn main() -> vd_core::Result<()> {
     // encoder can be built; otherwise the pipeline falls back to JPEG.
     let (width, height, fps) = video_settings();
     let broadcaster = video::Broadcaster::new();
-    let source = capture_source(width, height);
+    // One clock for the whole host: frame timestamps and heartbeat replies must
+    // be comparable, or a client cannot tell how old a frame is.
+    let clock = vd_core::Clock::new();
+    let source = capture_source(width, height, clock.clone());
     let encoder = hardware_encoder_factory();
     let capabilities = host_capabilities(encoder.is_some());
     video::spawn_capture(broadcaster.clone(), source, fps, (width, height), encoder);
@@ -81,6 +84,7 @@ fn main() -> vd_core::Result<()> {
         capabilities,
         broadcaster.clone(),
         identity_key,
+        clock,
     )?;
 
     info!(
@@ -173,7 +177,7 @@ fn host_capabilities(advertise_h264: bool) -> Capabilities {
 /// Picks the best available capture source: DXGI on Windows, else a test pattern.
 ///
 /// `VD_OUTPUT` selects the monitor index (default 0).
-fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
+fn capture_source(width: u32, height: u32, clock: vd_core::Clock) -> Box<dyn FrameSource + Send> {
     #[cfg(windows)]
     {
         let output = std::env::var("VD_OUTPUT")
@@ -188,7 +192,12 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
                     encoder_check(&gpu, width, height);
                     std::process::exit(0);
                 }
-                match dxgi::DxgiCapture::new(gpu.device.clone(), gpu.context.clone(), output) {
+                match dxgi::DxgiCapture::new(
+                    gpu.device.clone(),
+                    gpu.context.clone(),
+                    output,
+                    clock.clone(),
+                ) {
                     Ok(capture) => return Box::new(capture),
                     Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
                 }
@@ -196,7 +205,7 @@ fn capture_source(width: u32, height: u32) -> Box<dyn FrameSource + Send> {
             Err(err) => warn!("{err}; using the test pattern"),
         }
     }
-    Box::new(TestPattern::new(width, height))
+    Box::new(TestPattern::new(width, height, clock))
 }
 
 /// Builds the H.264 encoder factory.

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use vd_client::connection::{self, ConnectionEvent};
 use vd_client::frames::FrameQueue;
+use vd_client::latency::Latency;
 use vd_client::trust;
 use vd_core::discovery::{Browser, DiscoveryConfig, DiscoveryEvent};
 
@@ -54,11 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (events_tx, events_rx) = channel();
     let frames = FrameQueue::new();
+    let latency = Latency::new();
+    let sinks = connection::Sinks::new(events_tx, frames.clone(), latency);
     let handle = connection::connect(
         host.control_addr(),
         host.info.clone(),
-        events_tx,
-        frames.clone(),
+        sinks,
         trust::default_path(),
     );
 

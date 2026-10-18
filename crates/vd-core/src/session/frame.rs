@@ -168,7 +168,13 @@ mod tests {
 
     #[test]
     fn round_trips_heartbeat_frames() {
-        for message in [SessionMessage::Ping, SessionMessage::Pong] {
+        let ping = SessionMessage::Ping { sent_us: 11 };
+        let pong = SessionMessage::Pong {
+            sent_us: 11,
+            recv_us: 12,
+            reply_us: 13,
+        };
+        for message in [ping, pong] {
             let mut decoder = FrameDecoder::new();
             decoder.push(&encode(&message).unwrap());
             assert_eq!(decoder.next_message().unwrap(), Some(message));

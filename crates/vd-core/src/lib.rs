@@ -18,9 +18,11 @@
 //! abstraction exist so it can be built next.
 
 pub mod capture;
+pub mod clock;
 pub mod codec;
 pub mod discovery;
 pub mod error;
+pub mod latency;
 pub mod net;
 pub mod protocol;
 pub mod session;
@@ -30,10 +32,12 @@ pub mod video;
 mod test_support;
 
 pub use capture::{CaptureError, CapturedFrame, FrameSource};
+pub use clock::Clock;
 pub use codec::{
     decode_rgba, encode_jpeg, fit_frame, fit_within, CodecError, EncodedImage, RgbaImage,
 };
 pub use error::{Error, Result};
+pub use latency::{AgeStats, ClockOffset, ClockSync};
 pub use protocol::{
     DiscoveryMessage, Envelope, HostId, HostInfo, Platform, DEFAULT_CONTROL_PORT,
     DEFAULT_DISCOVERY_PORT, PROTOCOL_VERSION,
