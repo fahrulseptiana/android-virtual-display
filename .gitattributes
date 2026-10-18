@@ -1,0 +1,12 @@
+# Normalise line endings in the repository (LF) regardless of the host OS.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF so they run in cmd.exe / PowerShell.
+*.bat text eol=crlf
+
+# Binary assets must never be converted.
+*.png binary
+*.jpg binary
+*.webp binary
+*.jar binary
+*.so binary

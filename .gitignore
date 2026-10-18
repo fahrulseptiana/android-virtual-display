@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Android / Gradle
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+/android/.idea
+/android/*.iml
+/android/captures
+/android/.cxx
+/android/.externalNativeBuild
+
+# Native libraries are produced by `cargo ndk`, never committed.
+/android/app/src/main/jniLibs/
+
+# Editors / OS
+.vscode/
+.DS_Store
+Thumbs.db
