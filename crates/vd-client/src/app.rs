@@ -1,11 +1,14 @@
-//! The client UI: discover hosts, pair, and show the incoming video.
+//! The client UI.
+//!
+//! Two views: a browser (searching for hosts, then listing them) and a
+//! full-screen stream. The Android back button returns from the stream to the
+//! list.
 
 use std::net::SocketAddr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::load::SizedTexture;
 use vd_core::discovery::{Browser, DiscoveredHost, DiscoveryConfig, DiscoveryEvent};
 use vd_core::{HostInfo, RejectReason, Session};
 
@@ -15,8 +18,24 @@ use crate::frames::FrameQueue;
 /// How often the discovery socket is serviced while the UI is running.
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
-/// How often egui should repaint even without input (keeps video smooth).
+/// How often egui should repaint even without input: keeps the ripple animation
+/// smooth and drains the frame queue promptly.
 const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+
+/// A host seen more recently than this is treated as online.
+const ONLINE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Height of a host row.
+const ROW_HEIGHT: f32 = 60.0;
+
+/// Which screen the app is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// Searching for hosts, or listing the ones found.
+    Browser,
+    /// Full-screen remote desktop.
+    Stream,
+}
 
 /// State of the control connection.
 enum Connection {
@@ -49,27 +68,24 @@ impl Connection {
     }
 }
 
-/// eframe application showing the discovered hosts and the video stream.
+/// eframe application.
 pub struct VdClientApp {
+    view: View,
     browser: Option<Browser>,
     browser_error: Option<String>,
     last_poll: Instant,
     events_tx: Sender<ConnectionEvent>,
     events_rx: Receiver<ConnectionEvent>,
     connection: Connection,
-    /// The live connection, used to answer pairing requests.
+    /// The live connection, used to answer pairing requests and to disconnect.
     handle: Option<ConnectionHandle>,
-    /// Newest decoded frame, written by the connection worker.
+    /// Decoded frames waiting to be drawn.
     frames: FrameQueue,
     texture: Option<egui::TextureHandle>,
-    uploaded_sequence: Option<u64>,
     frames_seen: u64,
-    first_frame_at: Option<Instant>,
-    /// Diagnostic counters: UI passes, and distinct frames the worker produced.
-    repaints: u64,
-    /// Frames per second over the last reporting window.
     measured_fps: f32,
-    last_report: Instant,
+    /// The host currently connected to, for the stream overlay.
+    streaming_host: Option<String>,
 }
 
 impl VdClientApp {
@@ -77,6 +93,7 @@ impl VdClientApp {
     pub fn new() -> Self {
         let (events_tx, events_rx) = channel();
         let mut app = Self {
+            view: View::Browser,
             browser: None,
             browser_error: None,
             last_poll: Instant::now(),
@@ -86,12 +103,9 @@ impl VdClientApp {
             handle: None,
             frames: FrameQueue::new(),
             texture: None,
-            uploaded_sequence: None,
             frames_seen: 0,
-            first_frame_at: None,
-            repaints: 0,
             measured_fps: 0.0,
-            last_report: Instant::now(),
+            streaming_host: None,
         };
 
         match Browser::bind(DiscoveryConfig::default()) {
@@ -149,16 +163,16 @@ impl VdClientApp {
                 ConnectionEvent::Connecting { host, note } => Connection::Connecting { host, note },
                 ConnectionEvent::PairingRequired { host, pin } => Connection::Pairing { host, pin },
                 ConnectionEvent::Established(session) => {
-                    self.first_frame_at = Some(Instant::now());
-                    self.frames_seen = 0;
+                    self.streaming_host = Some(session.host.name.clone());
+                    // Straight to full screen once the session is up.
+                    self.view = View::Stream;
                     Connection::Connected { session }
                 }
                 ConnectionEvent::Rejected { host, reason } => Connection::Failed {
                     host,
                     reason: reject_text(reason),
                 },
-                // A failed attempt is not terminal: the worker retries. Keep the
-                // spinner going and surface the reason as a note.
+                // Not terminal: the worker retries, so keep the spinner going.
                 ConnectionEvent::Failed { host, error } => Connection::Connecting {
                     host,
                     note: Some(error),
@@ -169,12 +183,11 @@ impl VdClientApp {
 
     /// Uploads one queued frame as a texture.
     fn refresh_texture(&mut self, ctx: &egui::Context) {
-        // One frame per repaint: there is far more repaint headroom (~55/s) than
-        // frames (~30/s), so the queue stays empty and nothing is collapsed.
+        // One frame per repaint: there is far more repaint headroom than frames,
+        // so the queue stays empty and bursts are not collapsed.
         let Some(frame) = self.frames.next() else {
             return;
         };
-        let started = std::time::Instant::now();
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
@@ -186,42 +199,20 @@ impl VdClientApp {
                 self.texture = Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
             }
         }
-        self.uploaded_sequence = Some(frame.sequence);
         self.frames_seen += 1;
-
-        if self.frames_seen % 30 == 0 {
-            log::info!(
-                "upload: {} frames, {:.1} ms average",
-                self.frames_seen,
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
     }
 
-    /// Counts frames the decoder has produced (not how often we draw them).
-    /// Reports the two rates that matter while diagnosing the render path.
-    fn maybe_report(&mut self, _ctx: &egui::Context) {
-        if self.last_report.elapsed() < Duration::from_secs(5) {
-            return;
+    /// Leaves the stream and returns to the host list.
+    fn leave_stream(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.disconnect();
         }
-        let seconds = self.last_report.elapsed().as_secs_f32();
-        self.measured_fps = self.frames_seen as f32 / seconds;
-        log::info!(
-            "rates: {:.1} repaints/s, {:.1} frames/s drawn, {} queued",
-            self.repaints as f32 / seconds,
-            self.measured_fps,
-            self.frames.len(),
-        );
-        self.repaints = 0;
-        self.frames_seen = 0;
-        self.last_report = Instant::now();
-    }
-
-    fn scan_now(&mut self) {
-        if let Some(browser) = self.browser.as_mut() {
-            // Errors are non-fatal: we simply try again on the next tick.
-            let _ = browser.scan(Instant::now());
-        }
+        self.handle = None;
+        self.connection = Connection::Idle;
+        self.streaming_host = None;
+        self.view = View::Browser;
+        self.frames.clear();
+        self.texture = None;
     }
 
     fn start_connection(&mut self, addr: SocketAddr, host: HostInfo) {
@@ -231,7 +222,6 @@ impl VdClientApp {
         };
         self.frames.clear();
         self.texture = None;
-        self.uploaded_sequence = None;
         self.handle = Some(connection::connect(
             addr,
             host,
@@ -240,13 +230,38 @@ impl VdClientApp {
         ));
     }
 
-    /// Frames per second, measured over the reporting window.
-    ///
-    /// Dividing the running count by the time since the session started would
-    /// drift towards zero as the session goes on, because the count is reset
-    /// every window but the divisor is not.
+    /// Frames per second, measured over the last reporting window.
     fn fps(&self) -> f32 {
         self.measured_fps
+    }
+
+    fn report_rates(&mut self) {
+        static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+        let last = LAST.get_or_init(|| std::sync::Mutex::new(Instant::now()));
+        let mut last = last.lock().unwrap();
+        if last.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let seconds = last.elapsed().as_secs_f32();
+        self.measured_fps = self.frames_seen as f32 / seconds;
+        log::info!(
+            "rates: {:.1} frames/s drawn, {} queued",
+            self.measured_fps,
+            self.frames.len()
+        );
+        self.frames_seen = 0;
+        *last = Instant::now();
+    }
+
+    /// The host list, newest information first.
+    fn hosts(&self) -> Vec<DiscoveredHost> {
+        let mut hosts: Vec<DiscoveredHost> = self
+            .browser
+            .as_ref()
+            .map(|browser| browser.hosts().cloned().collect())
+            .unwrap_or_default();
+        hosts.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        hosts
     }
 }
 
@@ -258,73 +273,70 @@ impl Default for VdClientApp {
 
 impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.repaints += 1;
-        self.maybe_report(ui.ctx());
         self.poll_discovery();
         self.poll_connection();
         self.refresh_texture(ui.ctx());
+        self.report_rates();
         ui.ctx().request_repaint_after(REPAINT_INTERVAL);
 
-        let now = Instant::now();
-        let mut hosts: Vec<DiscoveredHost> = self
-            .browser
-            .as_ref()
-            .map(|browser| browser.hosts().cloned().collect())
-            .unwrap_or_default();
-        hosts.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        // Android's back button arrives as `BrowserBack`.
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::BrowserBack)) && self.view == View::Stream {
+            log::info!("leaving the stream");
+            self.leave_stream();
+        }
 
+        match self.view {
+            View::Stream => self.show_stream(ui),
+            View::Browser => self.show_browser(ui),
+        }
+    }
+}
+
+impl VdClientApp {
+    /// The searching / host list screen.
+    fn show_browser(&mut self, ui: &mut egui::Ui) {
+        let now = Instant::now();
+        let hosts = self.hosts();
         let connection = &self.connection;
-        let texture = self.texture.as_ref();
-        let connect_enabled = !connection.is_busy();
-        let fps = self.fps();
-        let mut scan_requested = false;
+        let busy = connection.is_busy();
+        let error = self.browser_error.clone();
         let mut connect_to: Option<(SocketAddr, HostInfo)> = None;
         let mut pairing_decision: Option<bool> = None;
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.heading("Virtual Display");
-            ui.label("Hosts on your local network");
-
-            ui.add_space(8.0);
-            connection_status(ui, connection, fps);
-
-            if let Some(texture) = texture {
-                ui.add_space(8.0);
-                show_video(ui, texture);
-            }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Scan now").clicked() {
-                    scan_requested = true;
-                }
-                ui.label(format!("{} found", hosts.len()));
-            });
-            ui.add_space(4.0);
-            ui.separator();
-
-            if let Some(error) = &self.browser_error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Discovery unavailable: {error}"),
-                );
-                return;
-            }
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if hosts.is_empty() {
-                    ui.add_space(12.0);
-                    ui.label("Searching for hosts…");
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x12, 0x12, 0x14)))
+            .show(ui, |ui| {
+                if let Some(error) = &error {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Discovery unavailable: {error}"),
+                    );
                     return;
                 }
-                for host in &hosts {
-                    if host_card(ui, host, now, connect_enabled) {
-                        connect_to = Some((host.control_addr(), host.info.clone()));
-                    }
+
+                if hosts.is_empty() {
+                    searching(ui);
+                    return;
                 }
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.heading("Nearby devices");
+                    });
+                    ui.add_space(12.0);
+
+                    for host in &hosts {
+                        if host_row(ui, host, now, !busy) {
+                            connect_to = Some((host.control_addr(), host.info.clone()));
+                        }
+                    }
+
+                    ui.add_space(16.0);
+                    status_line(ui, connection);
+                });
             });
-        });
 
         if let Connection::Pairing { host, pin } = connection {
             egui::Window::new("Pair device")
@@ -368,96 +380,212 @@ impl eframe::App for VdClientApp {
             }
         }
 
-        if scan_requested {
-            self.scan_now();
-        }
         if let Some((addr, host)) = connect_to {
             self.start_connection(addr, host);
         }
     }
-}
 
-/// Draws the video, fitted to the space available for it.
-fn show_video(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
-    let video = texture.size_vec2();
-    // Keep room for the status card and the host list below.
-    let available = egui::vec2(ui.available_width(), ui.available_height() * 0.65);
-    let scale = (available.x / video.x).min(available.y / video.y);
-    let size = video * scale.clamp(0.05, 1.0);
+    /// Full-screen video.
+    fn show_stream(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(0x08, 0x08, 0x0a));
 
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.add(egui::Image::new(SizedTexture::new(texture.id(), size)));
-    });
-}
-
-fn connection_status(ui: &mut egui::Ui, connection: &Connection, fps: f32) {
-    egui::Frame::group(ui.style()).show(ui, |ui| match connection {
-        Connection::Idle => {
-            ui.label("Not connected");
+        match self.texture.as_ref() {
+            Some(texture) => {
+                let size = texture.size_vec2();
+                let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                let target = egui::Rect::from_center_size(rect.center(), size * scale);
+                ui.painter().image(
+                    texture.id(),
+                    target,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                // Connected but nothing decoded yet.
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Waiting for the first frame…",
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::from_gray(180),
+                );
+            }
         }
+
+        stream_overlay(
+            ui,
+            rect,
+            self.streaming_host.as_deref(),
+            self.fps(),
+            &self.connection,
+        );
+    }
+}
+
+/// The "no hosts yet" screen: a rippling pulse plus a caption.
+fn searching(ui: &mut egui::Ui) {
+    // egui's clock drives the animation; the app repaints every 16 ms.
+    let time = ui.input(|i| i.time) as f32;
+    let available = ui.available_rect_before_wrap();
+    let center = available.center();
+    let painter = ui.painter();
+
+    // Three rings, each a third of a cycle apart.
+    for index in 0..3 {
+        let phase = (time * 0.5 + index as f32 / 3.0) % 1.0;
+        let radius = 18.0 + phase * 88.0;
+        let alpha = ((1.0 - phase) * 140.0) as u8;
+        painter.circle_stroke(
+            center - egui::vec2(0.0, 20.0),
+            radius,
+            egui::Stroke::new(
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(0x6c, 0xcb, 0x5f, alpha),
+            ),
+        );
+    }
+
+    painter.circle_filled(
+        center - egui::vec2(0.0, 20.0),
+        6.0,
+        egui::Color32::from_rgb(0x6c, 0xcb, 0x5f),
+    );
+    painter.text(
+        center + egui::vec2(0.0, 96.0),
+        egui::Align2::CENTER_CENTER,
+        "No Host Found",
+        egui::FontId::proportional(22.0),
+        egui::Color32::from_gray(210),
+    );
+    painter.text(
+        center + egui::vec2(0.0, 124.0),
+        egui::Align2::CENTER_CENTER,
+        "Searching your network…",
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_gray(130),
+    );
+}
+
+/// One tappable host row. Returns true when tapped.
+///
+/// The row is an explicitly allocated rectangle rather than a group frame: a
+/// frame's response does not reliably accept clicks when it contains labels.
+fn host_row(ui: &mut egui::Ui, host: &DiscoveredHost, now: Instant, enabled: bool) -> bool {
+    let age = host.age(now);
+    let online = age < ONLINE_WINDOW;
+
+    let desired = egui::vec2(ui.available_width(), ROW_HEIGHT);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(desired, sense);
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let background = if response.hovered() && enabled {
+            ui.visuals().widgets.hovered.bg_fill
+        } else {
+            ui.visuals().faint_bg_color
+        };
+        painter.rect_filled(rect, 8.0, background);
+
+        let left = rect.left_center();
+        painter.text(
+            left + egui::vec2(16.0, -10.0),
+            egui::Align2::LEFT_CENTER,
+            &host.info.name,
+            egui::FontId::proportional(16.0),
+            egui::Color32::from_gray(235),
+        );
+        painter.text(
+            left + egui::vec2(16.0, 12.0),
+            egui::Align2::LEFT_CENTER,
+            format!("{} · {}", host.info.platform, host.control_addr()),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(145),
+        );
+
+        let right = rect.right_center();
+        if online {
+            painter.circle_filled(
+                right - egui::vec2(18.0, 0.0),
+                5.0,
+                egui::Color32::from_rgb(0x6c, 0xcb, 0x5f),
+            );
+        } else {
+            painter.text(
+                right - egui::vec2(16.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                format!("{}s ago", age.as_secs()),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(140),
+            );
+        }
+    }
+
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(8.0);
+    enabled && response.clicked()
+}
+
+/// A one-line connection status under the list.
+fn status_line(ui: &mut egui::Ui, connection: &Connection) {
+    match connection {
+        Connection::Idle => {}
         Connection::Connecting { host, note } => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(format!("Connecting to {host}…"));
+                match note {
+                    Some(note) => ui.label(format!("Connecting to {host}… ({note})")),
+                    None => ui.label(format!("Connecting to {host}…")),
+                };
             });
-            if let Some(note) = note {
-                ui.label(format!("last attempt: {note}"));
-            }
         }
-        Connection::Pairing { host, pin } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Waiting to pair with {host}…"));
-            });
-            ui.label(format!("PIN: {pin:06}"));
+        Connection::Pairing { host, .. } => {
+            ui.label(format!("Waiting to pair with {host}…"));
         }
         Connection::Connected { session } => {
-            ui.colored_label(
-                egui::Color32::from_rgb(0x6c, 0xcb, 0x5f),
-                format!("Connected to {}", session.host.name),
-            );
-            ui.label(format!(
-                "protocol v{} · codec {} · {fps:.1} fps",
-                session.protocol,
-                session
-                    .codec
-                    .map(|codec| format!("{codec:?}"))
-                    .unwrap_or_else(|| "none".to_owned())
-            ));
+            ui.label(format!("Connected to {}", session.host.name));
         }
         Connection::Failed { host, reason } => {
             ui.colored_label(ui.visuals().error_fg_color, format!("{host}: {reason}"));
         }
-    });
+    }
 }
 
-fn host_card(
-    ui: &mut egui::Ui,
-    host: &DiscoveredHost,
-    now: Instant,
-    connect_enabled: bool,
-) -> bool {
-    let mut connect_clicked = false;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.strong(&host.info.name);
-            ui.label(format!("· {}", host.info.platform));
-            ui.add_space(8.0);
-            if ui
-                .add_enabled(connect_enabled, egui::Button::new("Connect"))
-                .clicked()
-            {
-                connect_clicked = true;
-            }
-        });
-        ui.label(format!("Address: {}", host.control_addr()));
-        ui.label(format!(
-            "Last seen: {:.1}s ago · v{}",
-            host.age(now).as_secs_f32(),
-            host.info.app_version
-        ));
-    });
-    connect_clicked
+/// Host name, frame rate and a way back, drawn over the video.
+fn stream_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    host: Option<&str>,
+    fps: f32,
+    connection: &Connection,
+) {
+    let text = match (host, connection) {
+        (Some(host), _) => format!("{host} · {fps:.0} fps · back to exit"),
+        (None, _) => "back to exit".to_owned(),
+    };
+
+    let padding = egui::vec2(10.0, 4.0);
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_gray(220),
+    );
+    let origin = rect.left_top() + egui::vec2(12.0, 12.0);
+    let banner = egui::Rect::from_min_size(origin, galley.size() + padding * 2.0);
+
+    ui.painter()
+        .rect_filled(banner, 6.0, egui::Color32::from_black_alpha(160));
+    ui.painter()
+        .galley(origin + padding, galley, egui::Color32::WHITE);
 }
 
 fn reject_text(reason: RejectReason) -> String {
