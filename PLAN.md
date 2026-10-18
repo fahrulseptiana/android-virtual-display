@@ -188,13 +188,13 @@ protected, because a different key is challenged.
       pointer position and bitmap and blends it into the frame before scaling.
       Handles all three shapes Windows emits (colour, masked-colour,
       monochrome AND/XOR).
-- [ ] **Windows.Graphics.Capture** — promoted from fallback by measurement, not
-      by preference. Desktop Duplication cannot see an indirect display at all:
-      with a virtual monitor installed and healthy, DXGI enumerates five
-      adapters and no output for it (Phase 7). WGC is therefore the only way to
-      capture a virtual display, and it is also wanted for HDR/protected cases
-      and per-window capture. It hands over a D3D11 texture rather than a CPU
-      buffer, which suits the zero-copy work better than duplication does.
+- [ ] **Fallback:** Windows.Graphics.Capture — wanted for HDR/protected cases
+      and per-window capture, and for anything duplication turns out not to
+      reach. It was briefly promoted to the only way to capture a virtual display
+      on the strength of a sandbox measurement that proved to be an artifact
+      (Phase 7); on hardware, duplication captures one fine. It still hands over
+      a D3D11 texture rather than a CPU buffer, which suits the zero-copy work
+      better than duplication does.
 - [ ] **Last resort:** GDI `BitBlt` — slow, but always available.
 - [ ] Pick a monitor at runtime rather than by index; handle monitors appearing
       and disappearing.
@@ -357,47 +357,50 @@ telling users to install a virtual display rather than shipping one. The
 alternative was an EV certificate, Microsoft attestation signing and quite
 possibly WHQL, to arrive back at something that already works.
 
-Three findings shape the phase, the first of them measured rather than assumed:
+Three findings shape the phase, and the first two are measured on this machine
+rather than reasoned about:
 
-1. **Desktop Duplication cannot see an indirect display.** Checked in a sandbox:
-   with VDD installed the monitor appears and is healthy
-   (`DISPLAY\MTT1337\...`), yet DXGI enumerates five adapters and **not one
-   output for it** — only the sandbox's own display has an output, on the AMD
-   adapter. So the capture backend changes for virtual displays, and
-   Windows.Graphics.Capture stops being a Phase 3 fallback and becomes the way
-   they are captured. It also hands over a D3D11 texture rather than a CPU
-   buffer, which suits the zero-copy work better than duplication does.
-2. **Extend still removes the largest cost in the project.** Per-monitor
-   duplication hands us the whole 3840x2160 output, which we downscale on the CPU
-   for 23 ms a frame. A virtual monitor can be *created at the size the tablet
-   wants*, so that downscale disappears instead of being optimised.
+1. **Desktop Duplication captures a virtual display like any other.** The VDD
+   monitor is output 1 of the AMD adapter -- `\\.\DISPLAY6`, 1920x1200, exactly
+   the mode it was configured with -- and duplication on it succeeds, which means
+   the host captures and encodes frames from it. So the capture path does not
+   change at all: a virtual monitor is another output to enumerate and choose.
+
+   This was checked in a sandbox first, and the sandbox said the opposite. That
+   was an artifact: its own display stack is virtualised, it presents a "Microsoft
+   Remote Display Adapter", and it never exposed the indirect output to DXGI. A
+   nested display stack is the wrong instrument for a question about display
+   topology -- the right one is the machine that has to do the work.
+
+2. **Extend removes the largest cost in the project.** Per-monitor duplication
+   hands us the whole 3840x2160 output and we scale it down on the CPU. Streaming
+   the virtual monitor at its own 1920x1200 measures **scale 0 ms**; asking for
+   1280x800 from the same monitor measures **17 ms**. Creating the monitor at the
+   client's size deletes that work rather than optimising it.
+
 3. **The dependency is an ordinary one.** VDD publishes a driver-only package --
    an INF, a UMDF DLL and a signed catalog -- configured by an XML file listing
-   the monitors, GPU and modes to offer. Two details are load-bearing and both
+   the monitors, GPU and modes to offer. Two details are load-bearing and each
    cost a debugging session: the settings file must be at
-   `C:\VirtualDisplayDriverdd_settings.xml`, not beside the INF, or the device
+   `C:\VirtualDisplayDriver\vdd_settings.xml`, not beside the INF, or the device
    installs and reports OK while creating no monitor at all; and the INF is
-   root-enumerated, so `pnputil` stages the package but something else — `devcon`
-   — has to create the device node.
+   root-enumerated, so `pnputil` stages the package but `devcon` has to create the
+   device node. A reboot finishes it.
 
-- [ ] **Step 1 — stream any display, virtual ones included.** List every output,
-      let the client pick, and let mirror versus extend fall out of which is
-      chosen. This *is* the feature: a virtual monitor is just another output.
-- [ ] **Step 2 — fit the tablet.** Offer a mode matching the client's panel, so
-      geometry is exact and nothing is letterboxed. VDD takes its mode list from
-      `vdd_settings.xml`, so this is a configuration question rather than a driver
-      one, and the client's screen size is what that file should be built from.
-- [ ] **Step 3 — capture virtual displays with Windows.Graphics.Capture.** Not a
-      fallback any more: duplication cannot see them (above). WGC takes an
-      `HMONITOR`, which the enumeration in Step 1 already provides, and yields a
-      D3D11 texture. The capture path is where the choice belongs, so
-      `FrameSource` stays the seam and the host picks a backend per display.
-- [ ] **Step 4 — wire the virtual display's own configuration.** VDD takes its
-      monitor count, GPU and mode list from `vdd_settings.xml`, so offering the
-      tablet's size is writing that file and restarting the device, not driver
-      work. It is also what makes the 23 ms downscale unnecessary rather than
-      merely faster.
-- [ ] **Step 5 — a monitor per client**, so two tablets can have a screen each.
+- [ ] **Step 1 — stream any display, virtual ones included.** List every output of
+      every adapter, let the client pick, and let mirror versus extend fall out of
+      which is chosen. This *is* the feature, and the enumeration is written:
+      `VD_LIST_OUTPUTS` reports adapters and outputs, and `VD_OUTPUT` already
+      selects one.
+- [ ] **Step 2 — choose it from the tablet.** The list is the host's; the choosing
+      should be the client's, over the control channel, with the choice remembered
+      per host.
+- [ ] **Step 3 — fit the tablet.** Offer a mode matching the client's panel, so
+      the geometry is exact and nothing is letterboxed. VDD takes its mode list
+      from `vdd_settings.xml`, which `scripts/install-vdd.ps1` already writes with
+      1920x1200 first, so this is a configuration question rather than a driver
+      one.
+- [ ] **Step 4 — a monitor per client**, so two tablets can have a screen each.
       Beyond the current one-viewer-per-host non-goal, so it waits on revisiting
       that rather than on anything here.
 
@@ -409,13 +412,19 @@ it rather than being guessed from the tablet's aspect ratio.
 
 VDD's own notes warn about display-priority changes and black screens after GPU
 driver updates, because Windows may promote a monitor with nothing attached. That
-is a real cost to experimenting on the machine in use, so the driver is tried in a
-disposable Windows Sandbox VM instead: install it, create a monitor, run capture
-against it, and clean up nothing but the window. VDD being signed is what makes
-this work at all, since the sandbox cannot enable test signing -- it has no
+is a real cost to experimenting on the machine in use, so the first attempt was a
+disposable Windows Sandbox VM: install the driver, create a monitor, run capture
+against it, clean up nothing but the window. VDD being signed is what makes that
+possible at all, since the sandbox cannot enable test signing -- it has no
 `CmDiag`, and it cannot open its own boot configuration store, both of which were
-checked rather than assumed. The tooling for it lives on the `windows-sandbox`
-branch.
+checked rather than assumed. The tooling lives on the `windows-sandbox` branch.
+
+It was worth doing, but it answered the wrong question. The sandbox is a good
+place to find out whether a driver *installs* -- it did, and three details had to
+be right for the monitor to appear at all. It is a bad place to ask whether DXGI
+can *see* the result, because its own display stack is virtualised and it presents
+a display adapter of its own. That is what produced the wrong answer above; the
+question needed the machine that has to do the work.
 
 #### Why not our own driver
 
@@ -430,11 +439,10 @@ driver but loading one:
 
 #### Known risks
 
-- **Windows.Graphics.Capture is a new backend**, and the only one that can see a
-  virtual display. It needs a session that is not a service, gives frames as
-  textures rather than CPU buffers, and has its own colour and cursor behaviour
-  to get right. That work is now on the critical path of the phase rather than
-  optional.
+- **The virtual display's mode list is a configuration file, not an API.** VDD
+  reads `vdd_settings.xml` at start-up, so changing what the tablet is offered
+  means rewriting that file and restarting the device. Fine for a first version,
+  and awkward if the client is ever meant to pick a size while the host runs.
 - **We would depend on a third-party driver** for the feature to exist at all.
   Acceptable because the licence is permissive, the project is active and the
   alternative is a signing process; it should still be a documented dependency
