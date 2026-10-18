@@ -16,6 +16,8 @@
 mod control;
 #[cfg(windows)]
 mod dxgi;
+#[cfg(windows)]
+mod encoder;
 mod identity;
 mod video;
 
@@ -60,6 +62,9 @@ fn main() -> vd_core::Result<()> {
         control.local_addr()?.port()
     );
     info!("waiting for clients on the local network (Ctrl+C to stop)");
+
+    #[cfg(windows)]
+    log_encoders();
 
     let running = Arc::new(AtomicBool::new(true));
     install_ctrlc_handler(running.clone());
@@ -130,6 +135,28 @@ fn video_settings() -> (u32, u32, u32) {
         .unwrap_or(video::DEFAULT_FPS);
 
     (width, height, fps)
+}
+
+/// Logs the H.264 encoders Media Foundation offers (hardware first).
+#[cfg(windows)]
+fn log_encoders() {
+    match encoder::media_foundation::h264_encoders() {
+        Ok(encoders) if encoders.is_empty() => warn!("no H.264 encoders found"),
+        Ok(encoders) => {
+            for info in &encoders {
+                info!(
+                    "H.264 encoder: {} ({})",
+                    info.name,
+                    if info.hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    }
+                );
+            }
+        }
+        Err(err) => warn!("could not enumerate H.264 encoders: {err}"),
+    }
 }
 
 fn install_ctrlc_handler(running: Arc<AtomicBool>) {
