@@ -11,7 +11,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -219,7 +219,8 @@ fn attempt(
     let mut buffer = [0u8; READ_BUFFER];
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut heartbeat: Option<Heartbeat> = None;
-    let mut video_decoder: Option<Decoder> = None;
+    // Decoding runs on its own thread so it never blocks the socket.
+    let decode_worker = DecoderWorker::spawn(frames.clone());
 
     loop {
         let now = Instant::now();
@@ -241,7 +242,7 @@ fn attempt(
                     if let Some(beat) = heartbeat.as_mut() {
                         // Any traffic proves the host is alive.
                         beat.on_activity(now);
-                        handle_stream(frames, &mut video_decoder, frame);
+                        handle_stream(frames, &decode_worker, frame);
                         continue;
                     }
 
@@ -369,7 +370,12 @@ fn confirm_pairing(
 }
 
 /// Handles a post-handshake message: codec configuration or a video frame.
-fn handle_stream(frames: &LatestFrame, decoder: &mut Option<Decoder>, frame: Frame) {
+///
+/// Decoding happens on its own thread. Doing it here would stop us reading the
+/// socket for ~18 ms per frame, the TCP window would fill, the host's write
+/// would block, and the broadcaster would drop frames — which is exactly what
+/// the first version of this did.
+fn handle_stream(frames: &LatestFrame, worker: &DecoderWorker, frame: Frame) {
     match frame {
         Frame::Control(SessionMessage::VideoConfig {
             format,
@@ -378,44 +384,166 @@ fn handle_stream(frames: &LatestFrame, decoder: &mut Option<Decoder>, frame: Fra
             extradata,
         }) => {
             if format == FrameFormat::H264 {
-                match Decoder::new(width, height, &extradata) {
-                    Ok(created) => {
-                        info!(
-                            "H.264 decoder ready ({width}x{height}, {} byte extradata)",
-                            extradata.len()
-                        );
-                        *decoder = Some(created);
-                    }
-                    Err(err) => {
-                        warn!("could not start the H.264 decoder: {err}");
-                        *decoder = None;
-                    }
-                }
-            } else {
-                *decoder = None;
+                worker.configure(width, height, extradata);
             }
         }
         // Pongs and anything else need no action.
         Frame::Control(_) => {}
-        Frame::Video(video) if video.header.format == FrameFormat::H264 => match decoder.as_mut() {
-            Some(decoder) => {
-                match decode_timed(decoder, &video.payload, video.header.timestamp_us) {
+        Frame::Video(video) if video.header.format == FrameFormat::H264 => {
+            worker.submit(
+                video.payload.clone(),
+                video.header.sequence,
+                video.header.timestamp_us,
+            );
+        }
+        // Anything else (JPEG, raw) is decoded straight into the mailbox.
+        Frame::Video(video) => publish_frame(frames, &video),
+    }
+}
+
+/// Work handed to the decoder thread.
+enum DecodeJob {
+    Configure {
+        width: u32,
+        height: u32,
+        extradata: Vec<u8>,
+    },
+    Frame {
+        payload: Vec<u8>,
+        sequence: u64,
+        timestamp_us: u64,
+    },
+}
+
+/// Number of access units to hold while the decoder is busy.
+const DECODE_QUEUE: usize = 4;
+
+/// Owns the decoder thread. Dropping it stops the thread.
+struct DecoderWorker {
+    jobs: Option<SyncSender<DecodeJob>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DecoderWorker {
+    fn spawn(frames: LatestFrame) -> Self {
+        let (jobs, receiver) = sync_channel(DECODE_QUEUE);
+        let handle = thread::spawn(move || decode_loop(receiver, frames));
+        Self {
+            jobs: Some(jobs),
+            handle: Some(handle),
+        }
+    }
+
+    fn configure(&self, width: u32, height: u32, extradata: Vec<u8>) {
+        self.send(DecodeJob::Configure {
+            width,
+            height,
+            extradata,
+        });
+    }
+
+    fn submit(&self, payload: Vec<u8>, sequence: u64, timestamp_us: u64) {
+        self.send(DecodeJob::Frame {
+            payload,
+            sequence,
+            timestamp_us,
+        });
+    }
+
+    /// Drops the job when the decoder is behind, rather than blocking the reader.
+    fn send(&self, job: DecodeJob) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return;
+        };
+        if let Err(TrySendError::Full(_)) = jobs.try_send(job) {
+            debug!("dropped a frame: the decoder is behind");
+        }
+    }
+}
+
+impl Drop for DecoderWorker {
+    fn drop(&mut self) {
+        // Closing the channel ends the loop.
+        self.jobs = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Counts access units in and pictures out, so the decoder's own throughput is
+/// visible independently of how often the UI happens to redraw.
+fn report_decode_throughput(produced: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static INPUTS: AtomicU64 = AtomicU64::new(0);
+    static OUTPUTS: AtomicU64 = AtomicU64::new(0);
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+
+    INPUTS.fetch_add(1, Ordering::Relaxed);
+    let outputs = OUTPUTS.fetch_add(produced as u64, Ordering::Relaxed) + produced as u64;
+
+    let last = LAST.get_or_init(|| std::sync::Mutex::new(Instant::now()));
+    let mut last = last.lock().unwrap();
+    if last.elapsed() >= Duration::from_secs(5) {
+        let seconds = last.elapsed().as_secs_f32();
+        let inputs = INPUTS.swap(0, Ordering::Relaxed);
+        OUTPUTS.store(0, Ordering::Relaxed);
+        info!(
+            "decoder: {:.1} access units/s in, {:.1} pictures/s out",
+            inputs as f32 / seconds,
+            outputs as f32 / seconds
+        );
+        *last = Instant::now();
+    }
+}
+
+fn decode_loop(jobs: Receiver<DecodeJob>, frames: LatestFrame) {
+    let mut decoder: Option<Decoder> = None;
+
+    while let Ok(job) = jobs.recv() {
+        match job {
+            DecodeJob::Configure {
+                width,
+                height,
+                extradata,
+            } => match Decoder::new(width, height, &extradata) {
+                Ok(created) => {
+                    info!(
+                        "H.264 decoder ready ({width}x{height}, {} byte extradata)",
+                        extradata.len()
+                    );
+                    decoder = Some(created);
+                }
+                Err(err) => {
+                    warn!("could not start the H.264 decoder: {err}");
+                    decoder = None;
+                }
+            },
+            DecodeJob::Frame {
+                payload,
+                sequence,
+                timestamp_us,
+            } => {
+                let Some(decoder) = decoder.as_mut() else {
+                    continue;
+                };
+                match decode_timed(decoder, &payload, timestamp_us) {
                     Ok(images) => {
+                        let produced = images.len();
                         for image in images {
                             frames.publish(DecodedFrame {
-                                sequence: video.header.sequence,
+                                sequence,
                                 width: image.width,
                                 height: image.height,
                                 pixels: image.pixels,
                             });
                         }
+                        report_decode_throughput(produced);
                     }
                     Err(err) => warn!("H.264 decode failed: {err}"),
                 }
             }
-            None => report_undecodable(video.header.format),
-        },
-        Frame::Video(video) => publish_frame(frames, &video),
+        }
     }
 }
 

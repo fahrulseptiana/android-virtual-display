@@ -65,6 +65,11 @@ pub struct VdClientApp {
     uploaded_sequence: Option<u64>,
     frames_seen: u64,
     first_frame_at: Option<Instant>,
+    /// Diagnostic counters: UI passes, and distinct frames the worker produced.
+    repaints: u64,
+    arrivals: u64,
+    last_arrival_sequence: Option<u64>,
+    last_report: Instant,
 }
 
 impl VdClientApp {
@@ -84,6 +89,10 @@ impl VdClientApp {
             uploaded_sequence: None,
             frames_seen: 0,
             first_frame_at: None,
+            repaints: 0,
+            arrivals: 0,
+            last_arrival_sequence: None,
+            last_report: Instant::now(),
         };
 
         match Browser::bind(DiscoveryConfig::default()) {
@@ -191,6 +200,34 @@ impl VdClientApp {
         }
     }
 
+    /// Counts frames the decoder has produced (not how often we draw them).
+    fn note_frame_arrival(&mut self) {
+        if let Some(frame) = self.frames.latest() {
+            if self.last_arrival_sequence != Some(frame.sequence) {
+                self.last_arrival_sequence = Some(frame.sequence);
+                self.arrivals += 1;
+            }
+        }
+    }
+
+    /// Reports the two rates that matter while diagnosing the render path.
+    fn maybe_report(&mut self, _ctx: &egui::Context) {
+        if self.last_report.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let seconds = self.last_report.elapsed().as_secs_f32();
+        log::info!(
+            "rates: {:.1} repaints/s, {:.1} frames/s, {:.1} uploads/s",
+            self.repaints as f32 / seconds,
+            self.arrivals as f32 / seconds,
+            self.frames_seen as f32 / seconds
+        );
+        self.repaints = 0;
+        self.arrivals = 0;
+        self.frames_seen = 0;
+        self.last_report = Instant::now();
+    }
+
     fn scan_now(&mut self) {
         if let Some(browser) = self.browser.as_mut() {
             // Errors are non-fatal: we simply try again on the next tick.
@@ -238,6 +275,9 @@ impl Default for VdClientApp {
 
 impl eframe::App for VdClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.repaints += 1;
+        self.note_frame_arrival();
+        self.maybe_report(ui.ctx());
         self.poll_discovery();
         self.poll_connection();
         self.refresh_texture(ui.ctx());
