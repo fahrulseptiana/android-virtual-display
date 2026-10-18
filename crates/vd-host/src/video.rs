@@ -4,8 +4,8 @@
 //! single-slot channel, so a client that cannot keep up simply misses frames
 //! instead of forcing unbounded buffering or slowing everyone down.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,12 +41,57 @@ pub trait VideoEncoder {
     fn request_keyframe(&mut self) {}
 }
 
-/// Builds an encoder once the stream size is known.
+/// Builds an encoder for a stream size.
 ///
 /// The size is only known after the first frame is captured and scaled, which is
-/// why this is a factory rather than an encoder.
+/// why this is a factory rather than an encoder -- and it has to be callable more
+/// than once, because `max_size` is a bound rather than a promise: a 3840x2160
+/// screen fits into 1280x720 and a 1920x1200 one into 1280x800, so switching
+/// between them changes the stream's size and the encoder has to be rebuilt for
+/// it. The client is told through the config generation.
 pub type EncoderFactory =
-    Box<dyn FnOnce(u32, u32, u32) -> Result<Box<dyn VideoEncoder>, String> + Send>;
+    Arc<dyn Fn(u32, u32, u32) -> Result<Box<dyn VideoEncoder>, String> + Send + Sync>;
+
+/// Builds a capture source for a display output.
+///
+/// A factory rather than a source because the client may change its mind about
+/// which display to watch, and the capture thread has to be able to make another
+/// one without being restarted. It cannot fail: a host that cannot duplicate an
+/// output falls back to the test pattern and says so.
+pub type SourceFactory = Box<dyn Fn(u32) -> Box<dyn FrameSource + Send> + Send>;
+
+/// What a running capture thread can be asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureCommand {
+    /// Capture this display output from now on.
+    SwitchTo(u32),
+}
+
+/// A handle on the capture thread.
+#[derive(Clone)]
+pub struct CaptureHandle {
+    commands: Sender<CaptureCommand>,
+    /// The output being captured, readable without a round trip.
+    current: Arc<AtomicU32>,
+}
+
+impl CaptureHandle {
+    /// Asks for a different display. Returns immediately; the thread does the
+    /// work when it next comes round.
+    ///
+    /// The request is recorded here as well as sent, so that a client told what
+    /// the host is showing right afterwards is told what it asked for rather than
+    /// whatever the thread had got round to.
+    pub fn switch_to(&self, index: u32) {
+        self.current.store(index, Ordering::Relaxed);
+        let _ = self.commands.send(CaptureCommand::SwitchTo(index));
+    }
+
+    /// Which output is being captured.
+    pub fn current(&self) -> u32 {
+        self.current.load(Ordering::Relaxed)
+    }
+}
 
 /// The codec configuration a client needs before it can decode anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +166,15 @@ impl Broadcaster {
         self.keyframe_wanted.swap(false, Ordering::Relaxed)
     }
 
+    /// Asks for a keyframe on the next frame.
+    ///
+    /// Needed whenever the *picture* changes discontinuously -- a new display, say
+    /// -- because a decoder that has never seen the new content cannot predict
+    /// forward into it from the old.
+    pub fn request_keyframe(&self) {
+        self.keyframe_wanted.store(true, Ordering::Relaxed);
+    }
+
     /// Records the current stream configuration.
     pub fn set_config(&self, config: StreamConfig) {
         let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
@@ -144,17 +198,31 @@ impl Broadcaster {
 pub fn spawn_capture(
     broadcaster: Arc<Broadcaster>,
     mut source: Box<dyn FrameSource + Send>,
+    initial_output: u32,
+    make_source: SourceFactory,
     fps: u32,
     max_size: (u32, u32),
     encoder: Option<EncoderFactory>,
-) {
+) -> CaptureHandle {
     let frame_interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
     info!("capture source: {}", source.describe());
+
+    let (commands, requests) = std::sync::mpsc::channel();
+    let current_output = Arc::new(AtomicU32::new(initial_output));
+    let handle = CaptureHandle {
+        commands,
+        current: current_output.clone(),
+    };
+    // The thread keeps its own note of what it has actually built, rather than
+    // reading the shared counter: `switch_to` writes the request there at once,
+    // and comparing against that would make the request look like a no-op.
+    let mut built = initial_output;
 
     thread::spawn(move || {
         let mut state = CaptureState {
             encoder: None,
             factory: encoder,
+            encoder_size: (0, 0),
             max_size,
             last_report: Instant::now(),
             sequence: 0,
@@ -166,6 +234,23 @@ pub fn spawn_capture(
 
         loop {
             let started = Instant::now();
+
+            // A client may have asked for a different display. The stream size is
+            // fixed, so the encoder is unaffected -- only the picture changes,
+            // which is why the clients are asked for a keyframe.
+            match requests.try_recv() {
+                Ok(CaptureCommand::SwitchTo(index)) => {
+                    if index != built {
+                        source = make_source(index);
+                        built = index;
+                        broadcaster.request_keyframe();
+                        info!("capturing display {index}: {}", source.describe());
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                // The host is going away.
+                Err(TryRecvError::Disconnected) => return,
+            }
 
             // Only capture while somebody is watching.
             let watching = broadcaster.has_subscribers();
@@ -222,12 +307,18 @@ pub fn spawn_capture(
             }
         }
     });
+
+    handle
 }
 
 /// Mutable state owned by the capture thread.
 struct CaptureState {
     encoder: Option<Box<dyn VideoEncoder>>,
+    /// Kept rather than taken, so it can build another encoder when the size
+    /// changes.
     factory: Option<EncoderFactory>,
+    /// What the current encoder was built for.
+    encoder_size: (u32, u32),
     /// Largest frame to put on the wire.
     max_size: (u32, u32),
     last_report: Instant,
@@ -311,7 +402,11 @@ impl CaptureState {
 
     /// Creates the H.264 encoder the first time a frame size is known.
     fn ensure_encoder(&mut self, broadcaster: &Broadcaster, width: u32, height: u32, fps: u32) {
-        let Some(factory) = self.factory.take() else {
+        if self.encoder.is_some() && self.encoder_size == (width, height) {
+            return;
+        }
+
+        let Some(factory) = self.factory.as_ref() else {
             return;
         };
 
@@ -326,6 +421,7 @@ impl CaptureState {
                     generation: 0,
                 });
                 self.encoder = Some(encoder);
+                self.encoder_size = (width, height);
             }
             Err(err) => {
                 warn!("H.264 unavailable ({err}); falling back to JPEG");

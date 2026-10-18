@@ -15,6 +15,7 @@
 
 mod control;
 #[cfg(windows)]
+mod displays;
 mod dxgi;
 #[cfg(windows)]
 mod encoder;
@@ -55,6 +56,18 @@ fn main() -> vd_core::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: encode a few synthetic frames and report, so the hardware
+    // encoder can be verified without a client.
+    #[cfg(windows)]
+    if std::env::var_os("VD_ENCODER_CHECK").is_some() {
+        let (width, height, _) = video_settings();
+        match gpu::create_device() {
+            Ok(gpu) => encoder_check(&gpu, width, height),
+            Err(err) => eprintln!("{err}"),
+        }
+        return Ok(());
+    }
+
     // A second host would fight the first over the discovery and control ports,
     // and would announce the same machine twice.
     #[cfg(windows)]
@@ -82,10 +95,22 @@ fn main() -> vd_core::Result<()> {
     // One clock for the whole host: frame timestamps and heartbeat replies must
     // be comparable, or a client cannot tell how old a frame is.
     let clock = vd_core::Clock::new();
-    let source = capture_source(width, height, clock.clone());
+    // The starting display, and then whichever one a client asks for. `VD_OUTPUT`
+    // is where a host driven by hand begins, not what it is stuck with.
+    let first_output = initial_output();
+    let make_source = source_factory(width, height, clock.clone());
+    let source = make_source(first_output);
     let encoder = hardware_encoder_factory();
     let capabilities = host_capabilities(encoder.is_some());
-    video::spawn_capture(broadcaster.clone(), source, fps, (width, height), encoder);
+    let capture = video::spawn_capture(
+        broadcaster.clone(),
+        source,
+        first_output,
+        make_source,
+        fps,
+        (width, height),
+        encoder,
+    );
 
     let identity_key = identity::load_or_create_identity_key()?;
     let control = control::ControlServer::bind(
@@ -94,6 +119,7 @@ fn main() -> vd_core::Result<()> {
         broadcaster.clone(),
         identity_key,
         clock,
+        capture,
     )?;
 
     info!(
@@ -235,21 +261,37 @@ fn host_capabilities(advertise_h264: bool) -> Capabilities {
 /// Picks the best available capture source: DXGI on Windows, else a test pattern.
 ///
 /// `VD_OUTPUT` selects the monitor index (default 0).
-fn capture_source(width: u32, height: u32, clock: vd_core::Clock) -> Box<dyn FrameSource + Send> {
+/// The display output to capture before any client has an opinion, from
+/// `VD_OUTPUT`.
+fn initial_output() -> u32 {
+    std::env::var("VD_OUTPUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Builds capture sources, one per display output.
+///
+/// One device for all of them, so switching display does not cross GPU
+/// boundaries, and one clock, so frame timestamps stay comparable with the ones
+/// the control channel hands out.
+///
+/// Never fails: a display that cannot be duplicated falls back to the test
+/// pattern and says so. A client that asked for a display and silently got a
+/// pattern would be a worse outcome than a log line explaining it.
+fn source_factory(width: u32, height: u32, clock: vd_core::Clock) -> video::SourceFactory {
     #[cfg(windows)]
     {
-        let output = std::env::var("VD_OUTPUT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
+        let gpu = match gpu::create_device() {
+            Ok(gpu) => Some(gpu),
+            Err(err) => {
+                warn!("{err}; using the test pattern");
+                None
+            }
+        };
 
-        // Capture and encoding share one device so frames never cross GPU boundaries.
-        match gpu::create_device() {
-            Ok(gpu) => {
-                if std::env::var_os("VD_ENCODER_CHECK").is_some() {
-                    encoder_check(&gpu, width, height);
-                    std::process::exit(0);
-                }
+        Box::new(move |output: u32| -> Box<dyn FrameSource + Send> {
+            if let Some(gpu) = gpu.as_ref() {
                 match dxgi::DxgiCapture::new(
                     gpu.device.clone(),
                     gpu.context.clone(),
@@ -257,26 +299,27 @@ fn capture_source(width: u32, height: u32, clock: vd_core::Clock) -> Box<dyn Fra
                     clock.clone(),
                 ) {
                     Ok(capture) => return Box::new(capture),
-                    Err(err) => warn!("DXGI capture unavailable ({err}); using the test pattern"),
+                    Err(err) => warn!("display {output}: {err}; using the test pattern"),
                 }
             }
-            Err(err) => warn!("{err}; using the test pattern"),
-        }
+            Box::new(TestPattern::new(width, height, clock.clone()))
+        })
     }
-    Box::new(TestPattern::new(width, height, clock))
+
+    #[cfg(not(windows))]
+    {
+        Box::new(move |_output: u32| -> Box<dyn FrameSource + Send> {
+            Box::new(TestPattern::new(width, height, clock.clone()))
+        })
+    }
 }
 
-/// Builds the H.264 encoder factory.
-///
-/// H.264 is the default; `VD_CODEC=jpeg` forces the interim JPEG path, and a
-/// machine without a usable encoder falls back to it automatically.
-#[cfg(windows)]
 fn hardware_encoder_factory() -> Option<video::EncoderFactory> {
     if std::env::var("VD_CODEC").as_deref() == Ok("jpeg") {
         return None;
     }
 
-    Some(Box::new(|width, height, fps| {
+    Some(std::sync::Arc::new(|width, height, fps| {
         let gpu = gpu::create_device().map_err(|err| err.to_string())?;
         let preference = encoder_preference();
         let encoder = encoder::h264::H264Encoder::new(

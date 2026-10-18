@@ -25,7 +25,8 @@ use vd_core::session::handshake::{Action, HostHandshake};
 use vd_core::video::VideoFrame;
 use vd_core::{Capabilities, Clock, HostInfo, Session, SessionMessage};
 
-use crate::video::Broadcaster;
+use crate::displays;
+use crate::video::{Broadcaster, CaptureHandle};
 
 /// Read buffer for a single `recv`.
 const READ_BUFFER: usize = 4096;
@@ -34,17 +35,26 @@ const READ_BUFFER: usize = 4096;
 /// flush pending video frames.
 const VIDEO_POLL: Duration = Duration::from_millis(10);
 
-/// Listens for, handshakes and streams to control connections.
-pub struct ControlServer {
-    listener: TcpListener,
+/// Everything a connection worker needs, so that `serve` takes three arguments
+/// rather than eight.
+#[derive(Clone)]
+struct SessionContext {
     host: HostInfo,
     capabilities: Capabilities,
     video: Arc<Broadcaster>,
-    /// Long-lived identity key, published in `Welcome` and used to authenticate.
     identity_secret: [u8; 32],
     /// The same clock the capture pipeline stamps frames from, so a client can
     /// compare the two and measure how long a frame took to arrive.
     clock: Clock,
+    /// How the worker asks for a different display, and finds out which one is
+    /// in use.
+    capture: CaptureHandle,
+}
+
+/// Listens for, handshakes and streams to control connections.
+pub struct ControlServer {
+    listener: TcpListener,
+    context: SessionContext,
 }
 
 impl ControlServer {
@@ -55,17 +65,21 @@ impl ControlServer {
         video: Arc<Broadcaster>,
         identity_secret: [u8; 32],
         clock: Clock,
+        capture: CaptureHandle,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", host.control_port))?;
         // Non-blocking so the host's discovery loop is never held up.
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
-            host,
-            capabilities,
-            video,
-            identity_secret,
-            clock,
+            context: SessionContext {
+                host,
+                capabilities,
+                video,
+                identity_secret,
+                clock,
+                capture,
+            },
         })
     }
 
@@ -79,21 +93,9 @@ impl ControlServer {
         loop {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
-                    let host = self.host.clone();
-                    let capabilities = self.capabilities.clone();
-                    let video = self.video.clone();
-                    let identity_secret = self.identity_secret;
-                    let clock = self.clock.clone();
+                    let context = self.context.clone();
                     thread::spawn(move || {
-                        if let Err(err) = serve(
-                            stream,
-                            peer,
-                            host,
-                            capabilities,
-                            video,
-                            identity_secret,
-                            clock,
-                        ) {
+                        if let Err(err) = serve(stream, peer, context) {
                             warn!("control connection from {peer} ended with error: {err}");
                         }
                     });
@@ -110,12 +112,16 @@ impl ControlServer {
 fn serve(
     mut stream: TcpStream,
     peer: SocketAddr,
-    host: HostInfo,
-    capabilities: Capabilities,
-    video: Arc<Broadcaster>,
-    identity_secret: [u8; 32],
-    clock: Clock,
+    context: SessionContext,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let SessionContext {
+        host,
+        capabilities,
+        video,
+        identity_secret,
+        clock,
+        capture,
+    } = context.clone();
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so the worker explicitly asks for blocking reads.
     stream.set_nonblocking(false)?;
@@ -248,6 +254,14 @@ fn serve(
                             return Err(err.into());
                         }
                     }
+                    SessionMessage::SelectDisplay { index } => {
+                        info!("{peer} asked for display {index}");
+                        capture.switch_to(index);
+                        // Sent back with the choice recorded, so the client's idea
+                        // of the current display comes from the host rather than
+                        // from optimism about its own request.
+                        send_displays(&mut stream, &mut channel, &capture)?;
+                    }
                     // Later steps: input events are handled here.
                     other => debug!("ignoring post-handshake message from {peer}: {other:?}"),
                 }
@@ -276,6 +290,9 @@ fn serve(
                     // Wake up regularly to send video.
                     stream.set_read_timeout(Some(VIDEO_POLL))?;
                     log_session(session, peer);
+                    // What the client could watch, so its first screen is a
+                    // choice rather than an assumption.
+                    send_displays(&mut stream, &mut channel, &capture)?;
                 }
                 None => {
                     info!("rejected control connection from {peer}");
@@ -284,6 +301,21 @@ fn serve(
             }
         }
     }
+}
+
+/// Tells the client what it could watch, and which of those it is watching.
+fn send_displays(
+    stream: &mut TcpStream,
+    channel: &mut Channel,
+    capture: &CaptureHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = SessionMessage::Displays {
+        current: capture.current(),
+        outputs: displays::available(),
+    };
+    let frame = channel.encode(&message)?;
+    stream.write_all(&frame)?;
+    Ok(())
 }
 
 /// What a frame costs the host, measured on the host's own clock.

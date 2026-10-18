@@ -39,6 +39,8 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
 };
+use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+use windows::Win32::UI::WindowsAndMessaging::EDD_GET_DEVICE_INTERFACE_NAME;
 
 /// How long to wait for a new frame before reporting "nothing changed".
 const ACQUIRE_TIMEOUT_MS: u32 = 50;
@@ -78,6 +80,18 @@ pub struct DisplayOutput {
     pub height: u32,
     /// Whether the output has a desktop on it at all.
     pub attached: bool,
+    /// Whether this is the screen the desktop starts on, which is what mirroring
+    /// means by "the display".
+    pub primary: bool,
+    /// What the monitor calls itself, e.g. "Generic Monitor (VDD by MTT)".
+    ///
+    /// Empty when Windows has nothing to say, which is often: an indirect display
+    /// and a television both come back as "Generic PnP Monitor".
+    pub monitor: String,
+    /// The monitor's device interface path, whose hardware id is where a virtual
+    /// display names itself, because its adapter does not -- it renders on the
+    /// ordinary GPU.
+    pub monitor_id: String,
 }
 
 /// An adapter DXGI will enumerate, and how many outputs it reports.
@@ -143,17 +157,26 @@ pub fn enumerate_outputs() -> Result<Vec<DisplayOutput>, CaptureError> {
             let mut output_index = 0;
             while let Ok(output) = adapter.EnumOutputs(output_index) {
                 match output.GetDesc() {
-                    Ok(desc) => found.push(DisplayOutput {
-                        adapter: adapter_index,
-                        output: output_index,
-                        adapter_name: adapter_name.clone(),
-                        device_name: wide_to_string(&desc.DeviceName),
-                        width: (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).max(0)
-                            as u32,
-                        height: (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top)
-                            .max(0) as u32,
-                        attached: desc.AttachedToDesktop.as_bool(),
-                    }),
+                    Ok(desc) => {
+                        let (monitor, monitor_id) = monitor_description(&desc.DeviceName);
+                        found.push(DisplayOutput {
+                            adapter: adapter_index,
+                            output: output_index,
+                            adapter_name: adapter_name.clone(),
+                            device_name: wide_to_string(&desc.DeviceName),
+                            width: (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left)
+                                .max(0) as u32,
+                            height: (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top)
+                                .max(0) as u32,
+                            attached: desc.AttachedToDesktop.as_bool(),
+                            // The primary monitor is the one at the origin, which
+                            // saves asking the display APIs a second question.
+                            primary: desc.DesktopCoordinates.left == 0
+                                && desc.DesktopCoordinates.top == 0,
+                            monitor,
+                            monitor_id,
+                        });
+                    }
                     Err(err) => {
                         debug!("output {adapter_index}:{output_index} has no description: {err}")
                     }
@@ -228,6 +251,37 @@ pub fn probe_duplication(
             .map_err(|err| CaptureError::Unavailable(format!("DuplicateOutput: {err}")))?;
         let desc = duplication.GetDesc();
         Ok((desc.ModeDesc.Width, desc.ModeDesc.Height))
+    }
+}
+
+/// The monitor attached to a `\\.\DISPLAYn`: its name, and its device path.
+///
+/// The enumeration is done twice: once to find the display, and once with that
+/// display's name to find the monitor on it. The second is where an indirect
+/// display gives itself away, and only in the device path -- its friendly name is
+/// the same placeholder a television gets.
+fn monitor_description(device: &[u16]) -> (String, String) {
+    // SAFETY: EnumDisplayDevicesW fills a struct this function owns; the device
+    // name is NUL-terminated because it came from a DXGI wide-string field.
+    unsafe {
+        let mut monitor = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if EnumDisplayDevicesW(
+            windows::core::PCWSTR(device.as_ptr()),
+            0,
+            &mut monitor,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+        .as_bool()
+        {
+            return (
+                wide_to_string(&monitor.DeviceString),
+                wide_to_string(&monitor.DeviceID),
+            );
+        }
+        (String::new(), String::new())
     }
 }
 
